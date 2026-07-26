@@ -7,9 +7,9 @@ src/**/*.pyc
 src/.venv/
 .venv/
 
-# Generated PDFs (except wiki/howto)
+# Generated PDFs (except wiki/docs)
 *.pdf
-!wiki/howto/*.pdf
+!wiki/docs/*.pdf
 
 # Firmware binaries
 *.bin
