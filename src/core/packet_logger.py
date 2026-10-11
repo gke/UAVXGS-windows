@@ -8,12 +8,18 @@ from typing import Any
 _TAG_NAMES = {
     13: "FLIGHT", 14: "NAV", 15: "STATS", 16: "CONTROL", 17: "PARAM",
     18: "MIN", 19: "ORIGIN", 20: "WP", 21: "MISSION", 22: "RC",
-    50: "REQUEST", 51: "ACK", 52: "MISC", 53: "NOISE", 54: "BB",
-    55: "INERTIAL", 56: "MINIMOSD", 57: "TUNING", 58: "UKF", 59: "GUIDANCE",
-    60: "ALTCTRL", 61: "SOARING", 62: "CALIB", 63: "AFNAME",
-    64: "WIND", 65: "TRACK", 66: "SERIAL", 67: "EXEC",
-    68: "ATTCTRL", 69: "LINK",
+    50: "REQUEST", 51: "ACK", 52: "MISC", 53: "UNUSED", 54: "BB",
+    55: "UNUSED", 56: "UNUSED", 57: "TUNING", 58: "UNUSED", 59: "GUIDANCE",
+    60: "UNUSED", 61: "UNUSED", 62: "CALIB", 63: "AFNAME",
+    64: "WIND", 65: "UNUSED", 66: "SERIAL", 67: "EXEC",
+    68: "UNUSED", 69: "LINK",
 }
+
+# Runtime diagnostic log bound. The per-packet log grows without limit, and a
+# 5.5 GB log.txt once blocked the GitHub push (GH001 >100 MB pre-receive).
+# Rotate once past this cap so the file can never regrow into the GBs; the
+# file itself is never shipped or pushed (see scripts/sweep_logs.sh).
+_LOG_MAX_BYTES = 2 * 1024 * 1024
 
 
 def _fmt(val: Any) -> str:
@@ -58,6 +64,11 @@ class PacketLogger:
         entry = _obj_fields(data) if data is not None else ""
         line = f"{ts} {direction} {name}  {entry}" if entry else f"{ts} {direction} {name}"
         try:
+            if os.path.getsize(self.log_file) > _LOG_MAX_BYTES:
+                try:
+                    os.remove(self.log_file)
+                except OSError:
+                    pass
             with open(self.log_file, 'a') as f:
                 f.write(line + '\n')
                 f.flush()

@@ -8,6 +8,8 @@ from PyQt5.QtWidgets import QWidget, QSizePolicy
 from PyQt5.QtCore import Qt, QRectF, QPointF, QSize
 from PyQt5.QtGui import QPainter, QPen, QBrush, QColor, QFont, QLinearGradient
 
+EXEC_BAR_FULL_SCALE_US = 4000.0  # bar full-scale; typical loop 250-1000us
+
 
 class AttitudeIndicator(QWidget):
     """Attitude indicator showing pitch and roll with execution time bar"""
@@ -36,7 +38,7 @@ class AttitudeIndicator(QWidget):
         """Set pitch (degrees), roll (degrees), heading (degrees)"""
         self.pitch = max(-90, min(90, pitch))
         self.roll = roll
-        self.heading = heading
+        self.heading = heading if heading == heading else 0.0  # NaN guard
         self.update()
     
     def set_exec_time(self, current_percent: float, peak_percent: float):
@@ -62,7 +64,7 @@ class AttitudeIndicator(QWidget):
         painter.rotate(-self.roll)
         
         pitch_scale = radius / 100.0
-        pitch_offset = int(-self.pitch * pitch_scale)
+        pitch_offset = int(self.pitch * pitch_scale)
         r = int(radius)
         
         # Sky
@@ -169,17 +171,17 @@ class ExecTimeBar(QWidget):
         self.exec_peak = 0.0
         self.bar_peak_color = QColor(180, 0, 0)
         self.bar_current_color = QColor(0, 120, 255)
-        self.setMinimumHeight(24)
-        self.setMaximumHeight(28)
+        self.setMinimumHeight(38)
+        self.setMaximumHeight(40)
         self.setMinimumWidth(200)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
     def sizeHint(self):
-        return QSize(300, 26)
+        return QSize(300, 38)
 
-    def set_exec_time(self, current_percent: float, peak_percent: float):
-        self.exec_current = max(0.0, min(100.0, current_percent))
-        self.exec_peak = max(0.0, min(100.0, peak_percent))
+    def set_exec_time(self, current_us: float, peak_us: float):
+        self.exec_current = max(0.0, current_us)
+        self.exec_peak = max(0.0, peak_us)
         self.update()
 
     def paintEvent(self, event):
@@ -198,13 +200,15 @@ class ExecTimeBar(QWidget):
         painter.setBrush(QBrush(QColor(20, 20, 20)))
         painter.drawRoundedRect(bar_x, bar_y, bar_width, bar_height, 3, 3)
 
-        peak_w = int(bar_width * self.exec_peak / 100.0)
+        peak_w = int(bar_width * self.exec_peak / EXEC_BAR_FULL_SCALE_US)
+        peak_w = min(peak_w, bar_width)
         if peak_w > 0:
             painter.setPen(Qt.NoPen)
             painter.setBrush(QBrush(self.bar_peak_color))
             painter.drawRoundedRect(bar_x, bar_y, peak_w, bar_height, 3, 3)
 
-        curr_w = int(bar_width * self.exec_current / 100.0)
+        curr_w = int(bar_width * self.exec_current / EXEC_BAR_FULL_SCALE_US)
+        curr_w = min(curr_w, bar_width)
         if curr_w > 0:
             painter.setPen(Qt.NoPen)
             painter.setBrush(QBrush(self.bar_current_color))
@@ -215,10 +219,10 @@ class ExecTimeBar(QWidget):
         painter.setFont(font)
         painter.setPen(QPen(Qt.white, 1))
         painter.drawText(bar_x + 4, bar_y + 14, "CPU")
-        pct_text = f"{self.exec_current:.0f}% / {self.exec_peak:.0f}%"
-        painter.drawText(bar_x + bar_width + 6, bar_y + 14, pct_text)
+        us_text = f"{self.exec_current:.0f} / {self.exec_peak:.0f} µs"
+        painter.drawText(bar_x + bar_width + 6, bar_y + 14, us_text)
 
-        # Centered percentage label drawn on top of the bar itself.
+        # Centered label drawn on top of the bar itself.
         if bar_width > 40:
             painter.setPen(QPen(Qt.white, 1))
             bold = QFont()
@@ -226,4 +230,4 @@ class ExecTimeBar(QWidget):
             bold.setBold(True)
             painter.setFont(bold)
             painter.drawText(bar_x, bar_y, bar_width, bar_height,
-                            Qt.AlignCenter, f"{self.exec_current:.0f}%")
+                            Qt.AlignCenter, f"{self.exec_current:.0f}µs")

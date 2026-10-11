@@ -40,9 +40,9 @@
 
 ---
 
-## Parameter Window — The Legacy Checkbox Is Gone
+## Parameter Window — The Legacy Checkbox Survives
 
-This is the single biggest usability change.
+The parameter editor changed substantially — but the familiar Legacy toggle did not disappear.
 
 ### Old System
 
@@ -56,35 +56,40 @@ Problems with the old system:
 
 ### New System
 
-All 128 parameters are `float32` — no exceptions. The FC stores and transmits every param as 4 IEEE-754 bytes. The GCS applies `PARAM_DISPLAY_MULT[idx]` to convert between FC-native units and the display value, uniformly for all parameters.
+All 128 parameters are `float32` — the FC stores and transmits every param as 4 IEEE-754 bytes. There is no longer a per-index uint8/float split, so no uint8 packing is needed on the GCS side.
 
-What disappeared:
-- **Legacy checkbox** — completely removed
-- **Legacy Tag column** — removed
-- **uint8 display conversion** — removed
-- **PARAM_SCALES** — removed from both FC and GCS
-- **LEGACY_TAGS** — removed from both FC and GCS
+The **Legacy checkbox is still there**, on the Advanced Parameters page. It is now purely a **display** toggle, and it defaults **off**:
+- **Off (default):** every parameter is shown as its unified raw float value, scaled by `PARAM_DISPLAY_MULT[idx]`.
+- **On:** the parameters listed in `LEGACY_TAGS` are shown in the classic legacy view — the raw value divided by that parameter's `PARAM_SCALES[idx]` (e.g. `RollRateKp` shows as `20`, `NavPosKp` as `15`), matching the old GCS's integer presentation.
+
+Editing a spinbox in Legacy mode is rescaled back to raw on write, so the raw float32 written to, and read back from, the FC is identical in either mode. The toggle never changes the stored value or the way the aircraft flies.
+
+The Legacy view is **transitional**. It lets you read and edit in the old familiar units if you are used to them, but it is best avoided: the per-parameter `PARAM_SCALES` factors are arbitrary historical constants, not physically meaningful units, so the numbers it shows carry no more information than the raw value. Prefer the default unified raw-float view.
+
+What actually went away:
+- The per-index **uint8 storage** on the FC — every param is now float32
+- The "Legacy Tag" conversion **column** in the table (the `LEGACY_TAGS`/`PARAM_SCALES` tables still exist in the source, but now only feed the display toggle)
+- The precision-loss hazard: save/load round-trips the raw float exactly regardless of display mode
 
 What stayed the same:
 - Parameters still have per-index display multipliers and limits
-- The FC still stores the same effective range (0–255 for former uint8 params, now as `(float32)(uint8)value`)
 - Airframe `.af` files still load and save the same way
 
 ### What This Means
 
 | Old Behaviour | New Behaviour |
 |---------------|---------------|
-| See "150" in a uint8 field, wonder if it's 150 raw or 150% | Always see the display value directly |
-| Click Legacy checkbox to see "75.0%" instead of "150" | No checkbox needed — you always see "75.0%" |
-| Save params, reload, get a different number because the mode was wrong | Save/load is always consistent |
-| Need to read the source to know if a param is uint8 or float | All params behave identically |
+| You had to know whether a param was uint8 or float | Every param is float32 over the wire |
+| Legacy checkbox toggled uint8 display ↔ converted float | Legacy checkbox remains, now a display-only toggle (default off) |
+| Saving/loading could lose precision if the mode was wrong | Save/load always round-trips the raw float exactly |
+| Adding a param meant updating conversion tables in FC and GCS | Conversion folded into the FC's per-index float scale |
 
 | Old | New |
 |-----|-----|
 | Two-page layout (Basic + Advanced) | Single table with category tabs |
 | Mixed uint8 + float display | Unified float32 — every param reads/writes as a decimal |
-| Legacy checkbox to switch uint8↔float | **Removed** — all params are always float |
-| "Legacy Tag" column present | **Removed** — `LEGACY_TAGS` and `PARAM_SCALES` deleted |
+| Legacy checkbox toggled uint8↔float | **Kept** — display-only, defaults off; switches `LEGACY_TAGS` params to the classic legacy-scaled view |
+| "Legacy Tag" column present | **Removed** — the `LEGACY_TAGS`/`PARAM_SCALES` tables now only feed the display toggle |
 | Manual refresh per page | One Read button loads all 128 params |
 | Parameter save in proprietary format | `.af` files — readable tagged format |
 

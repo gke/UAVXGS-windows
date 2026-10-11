@@ -2,6 +2,8 @@
 Complete UAVX Protocol Enums
 Mirrors the C header files (params.h, telem.h, protocol_constants.h, etc.)
 All enums start at 0 as per C convention
+
+Calibration and flight-safety work 2026-09-27 by OpenCode, Big Pickle & Friends.
 """
 
 from enum import IntEnum, Enum, IntFlag
@@ -12,54 +14,60 @@ from typing import Dict
 # Packet Tags (from telem.h PacketTags enum)
 # ============================================================================
 class PacketTag(IntEnum):
-    """UAVX packet tags - matches telem.h PacketTags"""
+    """UAVX packet tags - matches telem.h PacketTags (reserved slots kept)"""
     UNKNOWN = 0
-    LEV = 1
-    NAV = 2
-    MICROPILOT = 3
-    WAY = 4
-    AIRFRAME = 5
-    NAV_UPDATE = 6
-    BASIC = 7
-    RESTART = 8
-    TRIMBLE = 9
-    MESSAGE = 10
-    ENVIRONMENT = 11
-    BEACON = 12
+    UNUSED_LEV = 1
+    UNUSED_NAV = 2
+    UNUSED_MICROPILOT = 3
+    UNUSED_WAY = 4
+    UNUSED_AIRFRAME = 5
+    UNUSED_NAV_UPDATE = 6
+    UNUSED_BASIC = 7
+    UNUSED_RESTART = 8
+    UNUSED_TRIMBLE = 9
+    UNUSED_MESSAGE = 10
+    UNUSED_ENVIRONMENT = 11
+    UNUSED_BEACON = 12
     # UAVX packets start at 13
     FLIGHT = 13
     NAV_UAVX = 14
-    STATS = 15
+    UNUSED_STATS = 15
     CONTROL = 16
     PARAM = 17
     MIN = 18
     ORIGIN = 19
     WP = 20
-    MISSION = 21
+    UNUSED_MISSION = 21
     RC_CHANNELS = 22
 
     PARAM_TAGGED_READ = 71
     PARAM_COMMIT = 72
+    TEST_REQUEST = 73
+    TEST_RESPONSE = 74
+    AFNAME_SET = 75
+    I2C_ERRORS = 76
+    PARAM_IMAGE = 77
     REQUEST = 50
     ACK = 51
     MISC = 52
-    NOISE = 53
+    UNUSED_NOISE = 53
     BB = 54
-    INERTIAL = 55
-    MINIMOSD = 56
+    UNUSED_INERTIAL = 55
+    UNUSED_MINIMOSD = 56
     TUNING = 57
-    UKF = 58
+    UNUSED_UKF = 58
     GUIDANCE = 59
-    ALTITUDE_CONTROL = 60
-    SOARING = 61
+    UNUSED_ALTITUDE_CONTROL = 60
+    UNUSED_SOARING = 61
     CALIBRATION = 62
     AFNAME = 63
     WIND = 64
-    TRACK = 65
+    UNUSED_TRACK = 65
     SERIAL_PORTS = 66
     EXECUTION_TIME = 67
-    ATTITUDE_CONTROL = 68
+    REBOOT_INFO = 68
     LINK_STATS = 69
+    INIT_STATE = 70
     FRSKY = 99
 
 
@@ -73,29 +81,40 @@ class MiscCommand(IntEnum):
     LB = 2                # Loopback test
     UNUSED = 3            # Unused
     BB_DUMP = 4           # Dump Black Box
-    GPS_PASS_THRU = 5     # GPS Pass-through
+    GPS_PASS_THRU_UNUSED = 5   # Slot retained: GPS pass-through removed
     CAL_ACC = 6           # Calibrate Accelerometer only
-    CAL_GYRO = 7          # Calibrate Gyro only
+    # Slot 7 retained, retired 2026-09-28. Was the blocking two-temperature
+    # "gyro only" hot calibration. The gyro bias now comes from the per-launch
+    # grab (ErectRateGyros) and its temperature gradient is learned at that
+    # same grab, so the routine was removed from the FC and there is nothing
+    # left to send here. The wire value is kept so the enum indices of
+    # everything after it do not shift.
+    CAL_GYRO_RETIRED = 7
     BOOTLOADER = 8        # Enter bootloader
-    GPS_INIT = 9          # Force GPS re-initialization
+    # Slot 9 = GPS_INIT reserved (removed: blocked the FC main loop ~9.4s → IWDG reset)
     FORCE_DEFAULTS = 10   # Reset all params to embedded defaults
     SET_NAV_MODE = 11     # Set NavMode RC channel value: 0=Low(PIC), 1=Middle(Hold/Mission), 2=High(RTH)
     CYCLE_BB_LOG = 12     # Cycle black box log type
+    ESC_PROG = 13         # Enter ESC programming (4way/MSP runtime feed-through)
 
 
 # ============================================================================
 # Telemetry Types (from telem.h TelemetryTypes enum)
 # ============================================================================
 class TelemetryType(IntEnum):
-    """Telemetry output types - matches telem.h TelemetryTypes"""
-    UAVX_DJT = 0
-    INAV_LUA = 1
-    NO_TELEMETRY = 2
-    U4 = 3
-    U5 = 4
-    U6 = 5
-    U7 = 6
-    U8 = 7
+    """Reserved telemetry slots - matches telem.h TelemetryTypes (param 44)"""
+    # Telemetry is now auto-selected by RxType: CRSF -> CRSF telemetry (no
+    # entry here), CPPM -> D8 in fixed DJT format (iNavLUA-over-D8 retired).
+    # This enum is a reserved param slot only, kept for .af/flash index
+    # stability. UAVX_DJT/INAV_LUA are always D8; NoTelemetry=2 is the fallback.
+    eUAVXDJTTelemetry = 0
+    eINavLUATelemetry = 1
+    eNoTelemetry = 2
+    eU4Telemetry = 3
+    eU5Telemetry = 4
+    eU6Telemetry = 5
+    eU7Telemetry = 6
+    eU8Telemetry = 7
 
 
 # ============================================================================
@@ -103,11 +122,11 @@ class TelemetryType(IntEnum):
 # ============================================================================
 class InflightLog(IntEnum):
     """In-flight log types - matches telem.h inflightLogs"""
-    UAVX = 0
-    ALTITUDE = 1
-    PITCH = 2
-    ROLL = 3
-    YAW = 4
+    eLogUAVX = 0
+    eLogAltitude = 1
+    eLogPitch = 2
+    eLogRoll = 3
+    eLogYaw = 4
 
 
 # ============================================================================
@@ -115,19 +134,19 @@ class InflightLog(IntEnum):
 # ============================================================================
 class RCControl(IntEnum):
     """RC channel functions - maps to parameter values"""
-    THROTTLE = 0
-    ROLL = 1
-    PITCH = 2
-    YAW = 3
-    NAV_MODE = 4
-    ATTITUDE_MODE = 5
-    NAV_QUALIFICATION = 6
-    AUX1_CAM_PITCH = 7
-    AUX2 = 8
-    TRANSITION = 9
-    PASS_THRU = 10
-    UNUSED11 = 11
-    NULL = 12
+    eThrottleRC = 0
+    eRollRC = 1
+    ePitchRC = 2
+    eYawRC = 3
+    eArmingRC = 4
+    eAttitudeModeRC = 5
+    eNavModeRC = 6
+    ePassThruRC = 7
+    eDiveRC = 8
+    eTraceRC = 9
+    eTransitionRC = 10
+    eAux1CamPitchRC = 11
+    eNullRC = 12
 
 
 # ============================================================================
@@ -135,34 +154,101 @@ class RCControl(IntEnum):
 # ============================================================================
 class AirframeType(IntEnum):
     """Airframe types - matches params.h AFs"""
-    TRI = 0
-    TRI_COAX = 1          # Y6
-    VTAIL = 2
-    QUAD = 3
-    QUAD_X = 4
-    QUAD_COAX = 5         # OctoCoax
-    QUAD_COAX_X = 6
-    HEX = 7
-    HEX_X = 8
-    OCT = 9
-    OCT_X = 10
-    HELI_90 = 11
-    BI = 12
-    ELEVON = 13
-    DELTA = 14
-    AILERON = 15
-    AILERON_SPOILER_FLAPS = 16
-    AILERON_VTAIL = 17
-    RUDDER_ELEVATOR = 18
-    DIFFERENTIAL_TWIN = 19
-    VTOL = 20
-    VTOL2 = 21
-    TRACKED = 22
-    FOUR_WHEEL = 23
-    TWO_WHEEL = 24
-    GIMBAL = 25
-    INSTRUMENTATION = 26
-    UNKNOWN = 27
+    eTriAF = 0
+    eTriCoaxAF = 1          # Y6
+    eVTailAF = 2
+    eQuadAF = 3
+    eQuadXAF = 4
+    eQuadCoaxAF = 5         # OctoCoax
+    eQuadCoaxXAF = 6
+    eHexAF = 7
+    eHexXAF = 8
+    eOctAF = 9
+    eOctXAF = 10
+    eHeli90AF = 11
+    eBiAF = 12
+    eElevonAF = 13
+    eDeltaAF = 14
+    eAileronAF = 15
+    eAileronSpoilerFlapsAF = 16
+    eAileronVTailAF = 17
+    eRudderElevatorAF = 18
+    eDifferentialTwinAF = 19
+    eVTOLAF = 20
+    eVTOL2AF = 21
+    eTrackedAF = 22
+    eFourWheelAF = 23
+    eTwoWheelAF = 24
+    eInstrumentation = 25
+    eAFUnknown = 26
+
+
+# ============================================================================
+# Airframe Category (single authority — mirror of FC ClassifyAFType())
+# ============================================================================
+# params.h AirframeCategory enum (eCatMr..eCatLand) and ClassifyAFType() are
+# the ORIGINAL truth on the FC.  Every GCS Python consumer of the AF->category
+# mapping MUST use AIRFRAME_CATEGORY / category_of() below instead of defining
+# its own map — drift between mirrors already silently misclassified
+# eAileronVTailAF as a multirotor in the sim (test_pid_sim AF_CATEGORY omitted
+# it).  Anything not listed here falls to eCatMr by construction (the FC's
+# else branch).
+class AirframeCategory(IntEnum):
+    """Matches params.h AirframeCategory enum."""
+    eCatMr = 0   # multirotor
+    eCatFw = 1   # fixed wing
+    eCatVtol = 2 # VTOL / quadplane
+    eCatLand = 3 # ground vehicles
+
+
+# AF type -> category, exactly mirroring FC ClassifyAFType() (params.c).
+AIRFRAME_CATEGORY = {
+    AirframeType.eElevonAF: AirframeCategory.eCatFw,
+    AirframeType.eDeltaAF: AirframeCategory.eCatFw,
+    AirframeType.eAileronAF: AirframeCategory.eCatFw,
+    AirframeType.eAileronSpoilerFlapsAF: AirframeCategory.eCatFw,
+    AirframeType.eAileronVTailAF: AirframeCategory.eCatFw,
+    AirframeType.eRudderElevatorAF: AirframeCategory.eCatFw,
+    AirframeType.eVTOLAF: AirframeCategory.eCatVtol,
+    AirframeType.eVTOL2AF: AirframeCategory.eCatVtol,
+    AirframeType.eTrackedAF: AirframeCategory.eCatLand,
+    AirframeType.eFourWheelAF: AirframeCategory.eCatLand,
+    AirframeType.eTwoWheelAF: AirframeCategory.eCatLand,
+}
+
+
+def category_of(af_type):
+    """Return the AirframeCategory for an AF (enum value or int).
+
+    Mirror of FC ClassifyAFType() in params.c — anything unknown/illegal is
+    eCatMr (the FC else branch), never an exception.
+    """
+    try:
+        af = AirframeType(af_type)
+    except (ValueError, TypeError):
+        return AirframeCategory.eCatMr
+    return AIRFRAME_CATEGORY.get(af, AirframeCategory.eCatMr)
+
+
+# ============================================================================
+# Preflight Terms (from alarms.h PfTerms enum)
+# ============================================================================
+# Bit order is a WIRE CONTRACT: it rides in byte 1 of the tag-70 breadcrumb.
+# A bit set means that term is BLOCKING preflight. Mirrored from alarms.h;
+# check_boot_steps.py asserts FC/GCS parity.
+class PfTerms(IntEnum):
+    ePfTSignal = 0
+    ePfTRCMap = 1
+    ePfTRCStart = 2
+    ePfTArmed = 3
+    ePfTThrottle = 4
+    ePfTNavSw = 5
+    ePfTIMU = 6
+    ePfTAccCal = 7
+    ePfTBaro = 8
+    ePfTMag = 9
+    ePfTBatt = 10
+    ePfTCount = 11
 
 
 # ============================================================================
@@ -170,9 +256,9 @@ class AirframeType(IntEnum):
 # ============================================================================
 class ESCType(IntEnum):
     """Drive / ESC types"""
-    FAST_PWM = 0
-    DC_MOTORS = 1
-    DRIVES_DISARMED = 2
+    eESCPWM = 0
+    eDCMotors = 1
+    eMotorsOff = 2
 
 
 # ============================================================================
@@ -180,12 +266,12 @@ class ESCType(IntEnum):
 # ============================================================================
 class RxType(IntEnum):
     """Receiver types"""
-    CPPM = 0
-    FUTABA_SBUS = 1
-    SPEKTRUM_1024 = 2
-    SPEKTRUM_2048 = 3
-    CRSF = 4          # Crossfire/ExpressLRS
-    UNKNOWN = 5
+    eCPPMRx = 0
+    eFutabaSBusRx = 1
+    eSpektrum1024Rx = 2
+    eSpektrum2048Rx = 3
+    eCRSFRx = 4          # CRSF/ExpressLRS
+    eUnknownRx = 5
 
 
 # ============================================================================
@@ -193,10 +279,10 @@ class RxType(IntEnum):
 # ============================================================================
 class ArmingMode(IntEnum):
     """Arming modes"""
-    TX_ARMING = 0
-    SWITCH_ARMING = 1
-    UNUSED_ARMING_2 = 2
-    UNUSED_ARMING_3 = 3
+    eTxArming = 0
+    eSwitchArming = 1
+    eUnusedArming2 = 2
+    eUnusedArming3 = 3
 
 
 # ============================================================================
@@ -215,12 +301,12 @@ class GPSProtocol(IntEnum):
 # ============================================================================
 class RangefinderType(IntEnum):
     """Rangefinder types"""
-    MAX_SONAR_CM = 0
-    SRF_I2C_CM = 1
-    MAX_SONAR_I2C_CM = 2
-    SHARP_IR_GP2Y0A02YK = 3
-    SHARP_IR_GP2Y0A710K = 4
-    NO_RF = 5
+    eMaxSonarcm = 0
+    eSRFI2Ccm = 1
+    eMaxSonarI2Ccm = 2
+    eSharpIRGP2Y0A02YK = 3
+    eSharpIRGP2Y0A710K = 4
+    eNoRF = 5
 
 
 # ============================================================================
@@ -228,11 +314,11 @@ class RangefinderType(IntEnum):
 # ============================================================================
 class AirspeedSensorType(IntEnum):
     """Airspeed sensor types"""
-    MS4525D0_I2C = 0
-    MPXV7002DP_ANALOG = 1
-    AS_THERMOPILE_ANALOG = 2
-    AS_GPS_DERIVED = 3
-    NO_AS = 4
+    eMS4525D0I2C = 0
+    eMPXV7002DPAnalog = 1
+    eASThermopileAnalog = 2
+    eASGPSDerived = 3
+    eNoAS = 4
 
 
 # ============================================================================
@@ -240,12 +326,12 @@ class AirspeedSensorType(IntEnum):
 # ============================================================================
 class IMUFilterType(IntEnum):
     """IMU filter types"""
-    LPFILT = 0
-    MPUFILT = 1
-    PT1FILT = 2
-    IMU_FILT_3 = 3
-    IMU_FILT_4 = 4
-    IMU_FILT_5 = 5
+    eLP2Filt = 0
+    eHDLPFilt = 1
+    eF1 = 2
+    eF2 = 3
+    eF3 = 4
+    eF4 = 5
 
 
 # ============================================================================
@@ -253,38 +339,180 @@ class IMUFilterType(IntEnum):
 # ============================================================================
 class FlightState(IntEnum):
     """Flight state machine states"""
-    STARTING = 0
-    WARMUP = 1
-    LANDING = 2
-    LANDED = 3
-    SHUTDOWN = 4
-    FLYING = 5
-    IREMULATE = 6
-    PREFLIGHT = 7
-    READY = 8
-    THROTTLE_OPEN_CHECK = 9
-    ERECTING_GYROS = 10
-    MONITOR_INSTRUMENTS = 11
-    INITIALISING_GPS = 12
+    eStarting = 0
+    eWarmup = 1
+    eLanding = 2
+    eLanded = 3
+    eShutdown = 4
+    eInFlight = 5
+    eIREmulateUNUSED = 6
+    ePreflight = 7
+    eReady = 8
+    eThrottleOpenCheck = 9
+    eErectingGyros = 10
+    eMonitorInstruments = 11
+    eInitialisingGPS = 12
+    eBootStepBase = 13
+    eStepSerial = 14
+    eStepTarget = 15
+    eStepDrives = 16
+    eStepRC = 17
+    eStepBuses = 18
+    eStepAnalog = 19
+    eStepOLED = 20
+    eStepBattery = 21
+    eStepLEDs = 22
+    eStepIMU = 23
+    eStepMag = 24
+    eStepMadgwick = 25
+    eStepAlt = 26
+    eStepNVMem = 27
+    eStepTemp = 28
+    eStepCtrl = 29
+    eStepNav = 30
+    eStepEmu = 31
+    eStepSPI = 32
+    eStepInertFlt = 33
+    eStepIMUDrv = 34
+    eStepBaro = 35
+    eStepBaroDrv = 36
+    eStepGPS = 37
+    eStepIdentify = 38
 
+    eUnknownFlightState = 39
+
+    # Main-loop liveness breadcrumbs. Deliberately parked ABOVE eUnknownFlightState
+    # at explicit values: nothing existing renumbers, and because these are
+    # explicit the auto-numbered eStep* run above cannot collide with them.
+    eLivePreflight = 60
+    eLiveReady = 61
+    eLiveStarting = 62
+    eLiveErectingGyros = 63
+    eLiveWarmup = 64
+    eLiveMonitorInstruments = 65
+    eLiveInitialisingGPS = 66
+    eLiveThrottleOpenCheck = 67
+    eLiveLanded = 68
+    eLiveLanding = 69
+    eLiveShutdown = 70
     @classmethod
     def get_name(cls, state: int) -> str:
         names = {
-            cls.STARTING: "Starting",
-            cls.WARMUP: "Warmup",
-            cls.LANDING: "Landing",
-            cls.LANDED: "Landed",
-            cls.SHUTDOWN: "Shutdown",
-            cls.FLYING: "Flying",
-            cls.IREMULATE: "IREmulate",
-            cls.PREFLIGHT: "Preflight",
-            cls.READY: "Ready",
-            cls.THROTTLE_OPEN_CHECK: "Throttle",
-            cls.ERECTING_GYROS: "Erect Gyros",
-            cls.MONITOR_INSTRUMENTS: "Instrumentation",
-            cls.INITIALISING_GPS: "Init GPS"
+            cls.eStarting: "Starting",
+            cls.eWarmup: "Warmup",
+            cls.eLanding: "Landing",
+            cls.eLanded: "Landed",
+            cls.eShutdown: "Shutdown",
+            cls.eInFlight: "Flying",
+            cls.eIREmulateUNUSED: "IREmulate",
+            cls.ePreflight: "Preflight",
+            cls.eReady: "Ready",
+            cls.eThrottleOpenCheck: "Throttle",
+            cls.eErectingGyros: "Erect Gyros",
+            cls.eMonitorInstruments: "Instrumentation",
+            cls.eInitialisingGPS: "Init GPS",
+            cls.eStepSerial: "Init Serial",
+            cls.eStepTarget: "Init Target",
+            cls.eStepDrives: "Init Drives",
+            cls.eStepRC: "Init RC",
+            cls.eStepBuses: "Init Buses",
+            cls.eStepAnalog: "Init Analog",
+            cls.eStepOLED: "Init OLED",
+            cls.eStepBattery: "Init Battery",
+            cls.eStepLEDs: "Init LEDs",
+            cls.eStepIMU: "Init IMU",
+            cls.eStepMag: "Init Mag",
+            cls.eStepMadgwick: "Init Madgwick",
+            cls.eStepAlt: "Init Alt",
+            cls.eStepNVMem: "Init NVMem",
+            cls.eStepTemp: "Init Temp",
+            cls.eStepCtrl: "Init Ctrl",
+            cls.eStepNav: "Init Nav",
+            cls.eStepEmu: "Init Emu",
+            cls.eStepSPI: "Init SPI",
+            cls.eStepInertFlt: "Init Filt",
+            cls.eStepIMUDrv: "Init IMU Drv",
+            cls.eStepBaro: "Init Baro",
+            cls.eStepBaroDrv: "Init Baro Drv",
+            cls.eStepGPS: "Init GPS Drv",
+            cls.eStepIdentify: "Init Identify",
+            cls.eLivePreflight: "Live Preflight",
+            cls.eLiveReady: "Live Ready",
+            cls.eLiveStarting: "Live Starting",
+            cls.eLiveErectingGyros: "Live Erect Gyros",
+            cls.eLiveWarmup: "Live Warmup",
+            cls.eLiveMonitorInstruments: "Live Monitor Instr",
+            cls.eLiveInitialisingGPS: "Live Init GPS",
+            cls.eLiveThrottleOpenCheck: "Live Throttle Chk",
+            cls.eLiveLanded: "Live Landed",
+            cls.eLiveLanding: "Live Landing",
+            cls.eLiveShutdown: "Live Shutdown",
+            cls.eUnknownFlightState: "Unknown",
         }
         return names.get(state, f"Unknown({state})")
+
+    @classmethod
+    def get_mnemonic(cls, state: int) -> str:
+        """Short code per state (2-5 chars), for logs and compact columns.
+
+        Mirrors get_name()'s shape so the two can be swapped freely. Not used by
+        any display - call it explicitly. The eLive* codes carry an "L." prefix
+        because they sit next to the eStep* codes on the wire and would otherwise
+        be indistinguishable from them.
+        """
+        codes = {
+            cls.eStarting: "STG",
+            cls.eWarmup: "WRM",
+            cls.eLanding: "LNG",
+            cls.eLanded: "LND",
+            cls.eShutdown: "SHT",
+            cls.eInFlight: "FLY",
+            cls.eIREmulateUNUSED: "---",
+            cls.ePreflight: "PF",
+            cls.eReady: "RDY",
+            cls.eThrottleOpenCheck: "THR",
+            cls.eErectingGyros: "GYR",
+            cls.eMonitorInstruments: "MON",
+            cls.eInitialisingGPS: "GPS",
+            cls.eStepSerial: "SER",
+            cls.eStepTarget: "TGT",
+            cls.eStepDrives: "DRV",
+            cls.eStepRC: "RC",
+            cls.eStepBuses: "BUS",
+            cls.eStepAnalog: "ANL",
+            cls.eStepOLED: "OLD",
+            cls.eStepBattery: "BAT",
+            cls.eStepLEDs: "LED",
+            cls.eStepIMU: "IMU",
+            cls.eStepMag: "MAG",
+            cls.eStepMadgwick: "MDG",
+            cls.eStepAlt: "ALT",
+            cls.eStepNVMem: "NVM",
+            cls.eStepTemp: "TMP",
+            cls.eStepCtrl: "CTL",
+            cls.eStepNav: "NAV",
+            cls.eStepEmu: "EMU",
+            cls.eStepSPI: "SPI",
+            cls.eStepInertFlt: "IFL",
+            cls.eStepIMUDrv: "IDV",
+            cls.eStepBaro: "BAR",
+            cls.eStepBaroDrv: "BDV",
+            cls.eStepGPS: "GDR",
+            cls.eStepIdentify: "IDN",
+            cls.eLivePreflight: "L.PF",
+            cls.eLiveReady: "L.RDY",
+            cls.eLiveStarting: "L.STG",
+            cls.eLiveErectingGyros: "L.GYR",
+            cls.eLiveWarmup: "L.WRM",
+            cls.eLiveMonitorInstruments: "L.MON",
+            cls.eLiveInitialisingGPS: "L.GPS",
+            cls.eLiveThrottleOpenCheck: "L.THR",
+            cls.eLiveLanded: "L.LND",
+            cls.eLiveLanding: "L.LNG",
+            cls.eLiveShutdown: "L.SHT",
+            cls.eUnknownFlightState: "???",
+        }
+        return codes.get(state, f"?{state}")
 
 
 # ============================================================================
@@ -292,50 +520,50 @@ class FlightState(IntEnum):
 # ============================================================================
 class NavState(IntEnum):
     """Navigation state machine states"""
-    HOLDING_STATION = 0
-    RETURNING_HOME = 1
-    AT_HOME = 2
-    DESCENDING = 3
-    TOUCHDOWN = 4
-    TRANSITING = 5
-    LOITERING = 6
-    ORBITING_POI = 7
-    PERCHING = 8
-    TAKEOFF = 9
-    PIC = 10
-    ACQUIRING_ALTITUDE = 11
-    USING_THERMAL = 12
-    USING_RIDGE = 13
-    USING_WAVE = 14
-    BOOST_CLIMB = 15
-    ALTITUDE_LIMITING = 16
-    JUST_GLIDING = 17
-    WP_ALT_FAIL = 18
-    WP_PROXIMITY_FAIL = 19
+    eHoldingStation = 0
+    eReturningHome = 1
+    eAtHome = 2
+    eDescending = 3
+    eTouchdown = 4
+    eTransiting = 5
+    eLoitering = 6
+    eOrbitingPOI = 7
+    ePerching = 8
+    eTakeoff = 9
+    ePIC = 10
+    eAcquiringAltitude = 11
+    eUsingThermal = 12
+    eUsingRidge = 13
+    eUsingWave = 14
+    eBoostClimb = 15
+    eAltitudeLimiting = 16
+    eJustGliding = 17
+    eWPAltFail = 18
+    eWPProximityFail = 19
 
     @classmethod
     def get_name(cls, state: int) -> str:
         names = {
-            cls.HOLDING_STATION: "Holding",
-            cls.RETURNING_HOME: "Returning",
-            cls.AT_HOME: "@Home",
-            cls.DESCENDING: "Descending",
-            cls.TOUCHDOWN: "Touchdown",
-            cls.TRANSITING: "Transiting",
-            cls.LOITERING: "Loitering",
-            cls.ORBITING_POI: "Orbiting",
-            cls.PERCHING: "Perching",
-            cls.TAKEOFF: "Takeoff",
-            cls.PIC: "PIC",
-            cls.ACQUIRING_ALTITUDE: "Acquire Alt",
-            cls.USING_THERMAL: "Thermal",
-            cls.USING_RIDGE: "Ridge",
-            cls.USING_WAVE: "Wave",
-            cls.BOOST_CLIMB: "Boost",
-            cls.ALTITUDE_LIMITING: "Alt Lim",
-            cls.JUST_GLIDING: "Gliding",
-            cls.WP_ALT_FAIL: "ALTFAIL",
-            cls.WP_PROXIMITY_FAIL: "PROXFAIL"
+            cls.eHoldingStation: "Holding",
+            cls.eReturningHome: "Returning",
+            cls.eAtHome: "@Home",
+            cls.eDescending: "Descending",
+            cls.eTouchdown: "Touchdown",
+            cls.eTransiting: "Transiting",
+            cls.eLoitering: "Loitering",
+            cls.eOrbitingPOI: "Orbiting",
+            cls.ePerching: "Perching",
+            cls.eTakeoff: "Takeoff",
+            cls.ePIC: "PIC",
+            cls.eAcquiringAltitude: "Acquire Alt",
+            cls.eUsingThermal: "Thermal",
+            cls.eUsingRidge: "Ridge",
+            cls.eUsingWave: "Wave",
+            cls.eBoostClimb: "Boost",
+            cls.eAltitudeLimiting: "Alt Lim",
+            cls.eJustGliding: "Gliding",
+            cls.eWPAltFail: "ALTFAIL",
+            cls.eWPProximityFail: "PROXFAIL"
         }
         return names.get(state, f"Unknown({state})")
 
@@ -345,32 +573,61 @@ class NavState(IntEnum):
 # ============================================================================
 class Config1Bits(IntFlag):
     """Config1 bit masks - matches params.h Config1"""
-    USE_INVERT_MAG = 0x01           # bit 0
-    USE_RTH_DESCEND = 0x02          # bit 1
-    DISABLE_LEDS_IN_FLIGHT = 0x04   # bit 2
-    EMULATION_ENABLE = 0x08         # bit 3
-    USE_ALT_HOLD_ALARM = 0x10       # bit 4
-    USE_OFFSET_HOME = 0x20          # bit 5
-    USE_RAPID_DESCENT = 0x40        # bit 6
-    ENFORCE_DRIVE_SYMMETRY = 0x80   # bit 7
+    eUseInvertMag = 0x01           # bit 0
+    eUseRTHDescend = 0x02          # bit 1
+    eUsingMag = 0x04              # bit 2
+    eEmulationEnable = 0x08         # bit 3
+    eUseAltHoldAlarm = 0x10       # bit 4
+    eUseOffsetHome = 0x20          # bit 5
+    eEnforceDriveSymmetry = 0x80   # bit 7
 
-    # Default Config1 = EmulationEnableMask | EnforceDriveSymmetryMask
-    DEFAULT = EMULATION_ENABLE | ENFORCE_DRIVE_SYMMETRY
+    # bit 6 — FREE (was Test WP mission, folded into emulation 2026-09-23:
+    #   F.Emulation implies the 4-WP test mission). eTestMission kept as an
+    #   alias so legacy .af files still load without clobbering the bit.
+    eUnused1_6 = 0x40
+    eTestMission = eUnused1_6      # legacy .af token — do not re-use
+
+    # Default Config1 = FC DEFAULT_CONFIG1 (params.c): RTHDescend|AltHoldAlarm.
+    # eUsingMag is NOT in the default (2026-09-29): most target boards have no
+    # magnetometer fitted, and with the bit set the FC's arming gate demands a
+    # mag calibration that cannot be obtained. The bit remains settable as an
+    # operator override to ignore a present-but-untrustworthy mag.
+    DEFAULT = eUseRTHDescend | eUseAltHoldAlarm
 
 
 class Config2Bits(IntFlag):
     """Config2 bit masks - matches params.h Config2"""
-    USE_BATTERY_COMP = 0x01         # bit 0
-    USE_FAST_START = 0x02           # bit 1
-    USE_BLHELI = 0x04               # bit 2
-    USE_GLIDER_STRATEGY = 0x08      # bit 3
-    USE_PROP_SENSE = 0x10           # bit 4
-    USE_TURN_TO_WP = 0x20           # bit 5
-    USE_NAV_BEEP = 0x40             # bit 6
-    # bit 7 unusable
+    eUseBatteryComp = 0x01         # bit 0
+    eUnused2_1 = 0x02              # bit 1 — FREE (was eUseFastStart). FastStart only
+                                   # existed to skip the gyro grab, because a grab
+                                   # that could never succeed left the aircraft
+                                   # unarmable. The grab now always runs and always
+                                   # proceeds, falling back on the stored (and
+                                   # temperature-corrected) bias; a never-calibrated
+                                   # FC is blocked from arming by the FC instead.
+                                   # Available for a future feature.
+    eUseFastStart = eUnused2_1     # legacy .af token — do not re-use
+    eUnused2_2 = 0x04              # bit 2 — FREE (was UseESCProg). ESC-Prog is now
+                                   # runtime-triggered via the GCS ESC button (miscESCProg),
+                                   # so it needs no config bit. Available for a future feature.
+    eUseGPS = 0x08             # bit 3
+    ePropsInwards = 0x10           # bit 4 — SET = front two props rotate INWARDS (usual convention)
+    eUseTurnToWP = 0x20           # bit 5
+    eUseNavBeep = 0x40             # bit 6
+    eUnused2_7 = 0x80              # bit 7 — FREE. Available for a future feature.
 
-    # Default Config2 = UseFastStartMask
-    DEFAULT = USE_FAST_START
+    # Default Config2 = FC DEFAULT_CONFIG2 (params.c): BattComp|GPS|NavBeep
+    DEFAULT = eUseBatteryComp | eUseGPS | eUseNavBeep
+
+
+# ============================================================================
+# Failsafe Action Enum (from params.h FailsafeActions)
+# ============================================================================
+class FailsafeAction(IntEnum):
+    """Failsafe action on RC loss"""
+    eFsRth = 0
+    eFsLand = 1
+    eFsMotorsOff = 2
 
 
 # ============================================================================
@@ -412,7 +669,7 @@ class FlagBits(IntEnum):
     DC_MOTORS = 31
     SAT = 32
     DUMP_BB = 33
-    PARAM = 34
+    CONFIG_UNCOMMITTED = 34
     SIGNAL = 35
     WP_NAV = 36
     IMU = 37
@@ -434,14 +691,14 @@ class ParamIndex(IntEnum):
     """Parameter indices - matches params.h Params enum exactly"""
     ROLL_RATE_KP = 0           # 01
     ALT_POS_KI = 1             # 02
-    ROLL_ANGLE_KP = 2          # 03
+    ROLL_ANGLE_Q_KP = 2          # 03
     ARMING_MODE = 3            # 04
-    ROLL_ANGLE_INT_LIMIT = 4   # 05
+    ROLL_ANGLE_Q_INT_LIMIT = 4   # 05
     PITCH_RATE_KP = 5          # 06
     ALT_POS_KP = 6             # 07
-    PITCH_ANGLE_KP = 7         # 08
+    PITCH_ANGLE_Q_KP = 7         # 08
     RF_SENSOR_TYPE = 8         # 09
-    PITCH_ANGLE_INT_LIMIT = 9  # 10
+    PITCH_ANGLE_Q_INT_LIMIT = 9  # 10
     YAW_RATE_KP = 10           # 11
     ROLL_RATE_KD = 11          # 12
     IMU_FILT_TYPE = 12         # 13
@@ -451,12 +708,12 @@ class ParamIndex(IntEnum):
     RX_THROTTLE_CH = 16        # 17
     LOW_VOLT_THRES = 17        # 18
     ROLL_CAM_KP = 18           # 19
-    EST_CRUISE_THR = 19        # 20
+    UNUSED_20 = 19            # 20 — was EST_CRUISE_THR (moved to Config.CruiseThrottleFF)
     STICK_HYSTERESIS = 20      # 21
     FW_CLIMB_THROTTLE = 21     # 22
     PERCENT_IDLE_THR = 22      # 23
-    ROLL_ANGLE_KI = 23         # 24
-    PITCH_ANGLE_KI = 24        # 25
+    ROLL_ANGLE_Q_KI = 23         # 24
+    PITCH_ANGLE_Q_KI = 24        # 25
     PITCH_CAM_KP = 25          # 26
     SERVO_LPF_HZ = 26          # 27
     PITCH_RATE_KD = 27         # 28
@@ -477,7 +734,7 @@ class ParamIndex(IntEnum):
     RX_YAW_CH = 42             # 43
     AF_TYPE = 43               # 44
     TELEMETRY_TYPE = 44        # 45
-    MAX_DESCENT_RATE_DMP_S = 45 # 46
+    MAX_DESCENT_RATE_MP_S = 45  # 46
     DESCENT_DELAY_S = 46       # 47
     GYRO_LPF_SEL = 47          # 48
     NAV_CROSS_TRACK_KP = 48    # 49
@@ -494,20 +751,20 @@ class ParamIndex(IntEnum):
     RX_AUX4_CH = 59            # 60 - RCMap5
     NAV_POS_KI = 60            # 61
     UNUSED_GPS_PROTOCOL = 61   # 62 (auto-detected)
-    TILT_THROTTLE_FF = 62      # 63
+    NAV_POS_INT_LIM = 62       # 63
     MAX_YAW_RATE = 63          # 64
     FW_ROLL_PITCH_FF = 64      # 65
     FW_PITCH_THROTTLE_FF = 65  # 66
     UNUSED_ALT_VEL_INT_LIMIT = 66  # 67
-    FW_MAX_CLIMB_ANGLE = 67    # 68
+    FW_THR_CUT = 67            # 68 — FW throttle-cut threshold (below: snap to 0; see control.c ShapeFWThrottle)
     NAV_MAX_ANGLE = 68         # 69
     FW_SPOILER_DECAY_PERCENT_PS = 69  # 70
     FW_AILERON_DIFFERENTIAL = 70       # 71
     AS_SENSOR_TYPE = 71        # 72
-    KF_ACC_U_BIAS_VAR = 72     # 73
+    UNUSED_73 = 72            # 73 — was KFAccUBiasVar (tracked live in state.c)
     CONFIG2_BITS = 73          # 74
     MAX_PITCH_ANGLE = 74       # 75
-    QUAT_GAIN = 75            # 76
+    FW_ROLL_AUTHORITY = 75    # 76 — stabilised FW roll output scale (was QUAT_GAIN)
     MAX_ROLL_ANGLE = 76        # 77
     YAW_LPF_HZ = 77            # 78
     NAV_HEADING_TURNOUT = 78   # 79
@@ -520,7 +777,7 @@ class ParamIndex(IntEnum):
     VOLT_SCALE = 85             # 86
     FW_AILERON_RUDDER_MIX = 86 # 87
     FW_ALT_SPOILER_FF = 87     # 88
-    MAX_COMPASS_YAW_RATE = 88  # 89
+    MAX_HEADING_RATE = 88  # 89
     ACC_LPF_SEL = 89           # 90
     YAW_RATE_KD = 90           # 91
     UNUSED_92 = 91             # 92
@@ -528,9 +785,9 @@ class ParamIndex(IntEnum):
     RX_AUX5_CH = 93            # 94 - RCMap6
     RX_AUX6_CH = 94            # 95 - RCMap7
     RX_AUX7_CH = 95            # 96 - RCMap8
-    YAW_ANGLE_KP = 96          # 97
-    YAW_ANGLE_KI = 97          # 98
-    YAW_ANGLE_INT_LIMIT = 98   # 99
+    YAW_ANGLE_Q_KP = 96          # 97
+    YAW_ANGLE_Q_KI = 97          # 98
+    YAW_ANGLE_Q_INT_LIMIT = 98   # 99
     ALT_POS_INT_LIMIT = 99     # 100
     MOTOR_STOP_SEL = 100       # 101
     UNUSED_ALT_VEL_KI = 101    # 102
@@ -540,26 +797,26 @@ class ParamIndex(IntEnum):
     AH_ROC_WINDOW_MPS = 105    # 106
     NAV_PROX_ALT_M = 106       # 107
     NAV_PROX_RADIUS_M = 107    # 108
-    UNUSED_109 = 108           # 109
-    UNUSED_110 = 109           # 110
-    KF_BARO_VAR = 110          # 111
-    KF_ACC_U_VAR = 111         # 112
-    FW_STICK_SCALE = 112       # 113
-    FW_ROLL_CONTROL_PITCH_LIMIT = 113  # 114
+    YAW_RATE_KI = 108          # 109 — yaw rate-loop integral gain (heading hold)
+    YAW_RATE_INT_LIM = 109     # 110 — yaw rate-loop integral limit
+    UNUSED_111 = 110          # 111 — was KFBaroVar (tracked live in state.c)
+    UNUSED_112 = 111         # 112 — was KFAccUVar (tracked live in state.c)
+    FW_THR_RAMP_PS = 112      # 113 — FW throttle re-open slew limit (%/s)
+    FW_THR_HYST_BAND = 113    # 114 — FW throttle-cut re-open hysteresis band
     AH_THROTTLE_MOVING_TRIGGER = 114   # 115
     NAV_FENCE_RADIUS_M = 115   # 116
     DIVE_RECOVER_ALT = 116     # 117 — auto pull-out altitude AGL (m)
-    UNUSED_118 = 117           # 118
-    UNUSED_ALT_ROC_KP = 118    # 119
-    UNUSED_120 = 119           # 120
-    UNUSED_121 = 120           # 121
-    UNUSED_122 = 121           # 122
-    UNUSED_123 = 122           # 123
-    UNUSED_124 = 123           # 124
-    UNUSED_125 = 124           # 125
-    UNUSED_126 = 125           # 126
-    UNUSED_127 = 126           # 127
-    POWER_RESET_CAUSE = 127    # 128
+    FAILSAFE_ACTION = 117          # 118
+    FAILSAFE_DELAY = 118          # 119 — failsafe trigger delay (seconds)
+    BATTERY_ALARM_PCT = 119       # 120
+    ALT_ROC_KP = 120              # 121
+    MAX_CLIMB_RATE_MP_S = 121   # 122 — vertical-profile ascent shaping rate (m/s)
+    RUDDER_MOTOR_FF = 122          # 123
+    SPIRAL_DESCENT_BAND_M = 123      # 124 — residual altitude (m) that triggers MR spiral-orbit descent
+    FW_PITCH_AUTHORITY = 124  # 125 — stabilised FW pitch output scale (was FS_CONFIG_BITS)
+    TRACE_TYPE = 125   # trace capture selector (TraceTypes: 0=None 1=Rate 2=Attitude 3=AltHold 4=Actuator 5=IMU)
+    FW_YAW_AUTHORITY = 126  # 127 — stabilised FW yaw output scale
+    POWER_RESET_CAUSE = 127
 
 
 # ============================================================================
@@ -574,19 +831,19 @@ RC_MAP_INDICES = [
     ParamIndex.NAV_POS_KI,    # 60 - RCMap5 (Gear)
     ParamIndex.RX_AUX6_CH,    # 94 - RCMap6 (Aux1)
     ParamIndex.RX_AUX7_CH,    # 95 - RCMap7 (Aux2)
-    ParamIndex.YAW_ANGLE_KP,  # 96 - RCMap8 (Aux3)
+    ParamIndex.YAW_ANGLE_Q_KP,  # 96 - RCMap8 (Aux3)
 ]
 
 # Expected RC Map values (0-7 in order, matching RCControl enum)
 RC_MAP_EXPECTED = [
-    RCControl.THROTTLE,
-    RCControl.ROLL,
-    RCControl.PITCH,
-    RCControl.YAW,
-    RCControl.NAV_MODE,
-    RCControl.ATTITUDE_MODE,
-    RCControl.NAV_QUALIFICATION,
-    RCControl.AUX1_CAM_PITCH,
+    RCControl.eThrottleRC,
+    RCControl.eRollRC,
+    RCControl.ePitchRC,
+    RCControl.eYawRC,
+    RCControl.eArmingRC,
+    RCControl.eAttitudeModeRC,
+    RCControl.eNavModeRC,
+    RCControl.ePassThruRC,
 ]
 
 # RC Mapping: param index -> function name (for display)
@@ -595,11 +852,11 @@ RC_MAPPING_NAMES = {
     ParamIndex.RX_ROLL_CH: "Roll",
     ParamIndex.RX_PITCH_CH: "Pitch",
     ParamIndex.RX_YAW_CH: "Yaw",
-    ParamIndex.RX_GEAR_CH: "Gear",
-    ParamIndex.RX_AUX1_CH: "Aux1",
-    ParamIndex.RX_AUX2_CH: "Aux2",
-    ParamIndex.RX_AUX3_CH: "Aux3",
-    ParamIndex.RX_AUX4_CH: "Aux4",
+    ParamIndex.RX_GEAR_CH: "NavMode",
+    ParamIndex.RX_AUX1_CH: "AttMode",
+    ParamIndex.RX_AUX2_CH: "Arming",
+    ParamIndex.RX_AUX3_CH: "CamPitch",
+    ParamIndex.RX_AUX4_CH: "Trace",
     ParamIndex.RX_AUX5_CH: "Aux5",
     ParamIndex.RX_AUX6_CH: "Aux6",
     ParamIndex.RX_AUX7_CH: "Aux7",
@@ -637,96 +894,106 @@ def get_airframe_name(af_type: int) -> str:
 # Type Mapping Dictionaries (for UI display)
 # ============================================================================
 AIRFRAME_NAMES = {
-    AirframeType.TRI: "Tricopter",
-    AirframeType.TRI_COAX: "CoaxTri Y6",
-    AirframeType.VTAIL: "VTail Y4",
-    AirframeType.QUAD: "Quadcopter",
-    AirframeType.QUAD_X: "X Quadcopter",
-    AirframeType.QUAD_COAX: "Coax Quad",
-    AirframeType.QUAD_COAX_X: "X Coax Quad",
-    AirframeType.HEX: "Hexacopter",
-    AirframeType.HEX_X: "X Hexacopter",
-    AirframeType.OCT: "Octocopter",
-    AirframeType.OCT_X: "X Octocopter",
-    AirframeType.HELI_90: "Heli90",
-    AirframeType.BI: "Heli120",
-    AirframeType.ELEVON: "Flying Wing",
-    AirframeType.DELTA: "Delta",
-    AirframeType.AILERON: "Aileron",
-    AirframeType.AILERON_SPOILER_FLAPS: "Spoilerons",
-    AirframeType.AILERON_VTAIL: "VTail",
-    AirframeType.RUDDER_ELEVATOR: "Rudder Elevator",
-    AirframeType.DIFFERENTIAL_TWIN: "Differential Twin",
-    AirframeType.VTOL: "VTOL",
-    AirframeType.VTOL2: "VTOL2",
-    AirframeType.TRACKED: "Tracked",
-    AirframeType.FOUR_WHEEL: "Four Wheel",
-    AirframeType.TWO_WHEEL: "Two Wheel",
-    AirframeType.GIMBAL: "Gimbal",
-    AirframeType.INSTRUMENTATION: "Instrumentation",
-    AirframeType.UNKNOWN: "Unknown Aircraft",
+    AirframeType.eTriAF: "Tricopter",
+    AirframeType.eTriCoaxAF: "CoaxTri Y6",
+    AirframeType.eVTailAF: "VTail Y4",
+    AirframeType.eQuadAF: "Quadcopter",
+    AirframeType.eQuadXAF: "X Quadcopter",
+    AirframeType.eQuadCoaxAF: "Coax Quad",
+    AirframeType.eQuadCoaxXAF: "X Coax Quad",
+    AirframeType.eHexAF: "Hexacopter",
+    AirframeType.eHexXAF: "X Hexacopter",
+    AirframeType.eOctAF: "Octocopter",
+    AirframeType.eOctXAF: "X Octocopter",
+    AirframeType.eHeli90AF: "Heli90",
+    AirframeType.eBiAF: "Heli120",
+    AirframeType.eElevonAF: "Elevon",
+    AirframeType.eDeltaAF: "Delta",
+    AirframeType.eAileronAF: "Aileron",
+    AirframeType.eAileronSpoilerFlapsAF: "Spoilerons",
+    AirframeType.eAileronVTailAF: "VTail",
+    AirframeType.eRudderElevatorAF: "Rudder Elevator",
+    AirframeType.eDifferentialTwinAF: "Differential Twin",
+    AirframeType.eVTOLAF: "VTOL",
+    AirframeType.eVTOL2AF: "VTOL2",
+    AirframeType.eTrackedAF: "Tracked",
+    AirframeType.eFourWheelAF: "Four Wheel",
+    AirframeType.eTwoWheelAF: "Two Wheel",
+    AirframeType.eInstrumentation: "Instrumentation",
+    AirframeType.eAFUnknown: "Unknown Aircraft",
 }
 
 # Airframe types marked as redacted (legacy/rarely used) — matches FC RedactedAF[28]
 REDACTED_AIRFRAMES = frozenset({
-    AirframeType.TRI,              # 0
-    AirframeType.TRI_COAX,         # 1
-    AirframeType.VTAIL,            # 2
-    AirframeType.QUAD,             # 3
-    AirframeType.QUAD_COAX,        # 5
-    AirframeType.QUAD_COAX_X,      # 6
-    AirframeType.HEX,              # 7
-    AirframeType.OCT,              # 9
-    AirframeType.HELI_90,          # 11
-    AirframeType.BI,               # 12
-    AirframeType.ELEVON,           # 13
-    AirframeType.AILERON,          # 15
-    AirframeType.AILERON_VTAIL,    # 17
-    AirframeType.VTOL,             # 20
-    AirframeType.VTOL2,            # 21
-    AirframeType.FOUR_WHEEL,       # 23
-    AirframeType.TWO_WHEEL,        # 24
-    AirframeType.UNKNOWN,          # 27
+    AirframeType.eTriAF,              # 0
+    AirframeType.eTriCoaxAF,         # 1
+    AirframeType.eVTailAF,            # 2
+    AirframeType.eQuadAF,             # 3
+    AirframeType.eQuadCoaxAF,        # 5
+    AirframeType.eQuadCoaxXAF,      # 6
+    AirframeType.eHexAF,              # 7
+    AirframeType.eOctAF,              # 9
+    AirframeType.eHeli90AF,          # 11
+    AirframeType.eBiAF,               # 12
+    AirframeType.eAileronAF,          # 15
+    AirframeType.eAileronVTailAF,    # 17
+    AirframeType.eVTOLAF,             # 20
+    AirframeType.eVTOL2AF,            # 21
+    AirframeType.eFourWheelAF,       # 23
+    AirframeType.eTwoWheelAF,        # 24
+    AirframeType.eAFUnknown,          # 27
 })
 
 # Active airframe types (non-redacted) — for pulldown display
 # Derived from REDACTED_AIRFRAMES — single source of truth
 ACTIVE_AIRFRAMES = frozenset({
     af for af in AirframeType
-    if af not in REDACTED_AIRFRAMES and af != AirframeType.UNKNOWN
+    if af not in REDACTED_AIRFRAMES and af != AirframeType.eAFUnknown
 })
 
+# ALL selectable airframe types — exhaustive, name-sorted (single source for the
+# GCS AF_TYPE combos). Includes REDACTED_AIRFRAMES members so that any value the
+# FC or an .af file can legitimately produce resolves via findData() — e.g.
+# generic/SkySurfer_Bixler.af uses eAileronAF (15), which is in REDACTED but
+# MUST round-trip. Without the full set, a load/readback whose findData() misses
+# fell back to treating the raw value as a positional index, landing on the
+# WRONG airframe (FW -> X Quadcopter, Elevon -> Delta). eAFUnknown stays out.
+ALL_AIRFRAMES = tuple(sorted(
+    (af for af in AirframeType if af != AirframeType.eAFUnknown),
+    key=lambda x: AIRFRAME_NAMES[x].lower(),
+))
+
 ESC_TYPE_NAMES = {
-    ESCType.FAST_PWM: "FastPWM",
-    ESCType.DC_MOTORS: "DCMotors",
-    ESCType.DRIVES_DISARMED: "MotorsOff",
+    ESCType.eESCPWM: "FastPWM",
+    ESCType.eDCMotors: "DCMotors",
+    ESCType.eMotorsOff: "MotorsOff",
 }
 
 RX_TYPE_NAMES = {
-    RxType.CPPM: "CPPM",
-    RxType.FUTABA_SBUS: "SBus",
-    RxType.SPEKTRUM_1024: "Spektrum 1024",
-    RxType.SPEKTRUM_2048: "Spektrum 2048",
-    RxType.CRSF: "CRFS/ExpressLRS",
-    RxType.UNKNOWN: "Unknown Rx",
+    RxType.eCPPMRx: "CPPM",
+    RxType.eFutabaSBusRx: "SBus",
+    RxType.eSpektrum1024Rx: "Spektrum 1024",
+    RxType.eSpektrum2048Rx: "Spektrum 2048",
+    RxType.eCRSFRx: "CRSF/ELRS",
+    RxType.eUnknownRx: "Unknown Rx",
 }
 
 ARMING_MODE_NAMES = {
-    ArmingMode.TX_ARMING: "Tx Arming",
-    ArmingMode.SWITCH_ARMING: "Sw Arming",
-    ArmingMode.UNUSED_ARMING_2: "u2",
-    ArmingMode.UNUSED_ARMING_3: "u3",
+    ArmingMode.eTxArming: "Tx Arming",
+    ArmingMode.eSwitchArming: "Sw Arming",
+    ArmingMode.eUnusedArming2: "u2",
+    ArmingMode.eUnusedArming3: "u3",
 }
 
 TELEMETRY_TYPE_NAMES = {
-    TelemetryType.UAVX_DJT: "DJT Decoder",
-    TelemetryType.INAV_LUA: "LUA Script",
-    TelemetryType.NO_TELEMETRY: "No Telemetry",
-    TelemetryType.U4: "u4",
-    TelemetryType.U5: "u5",
-    TelemetryType.U6: "u6",
-    TelemetryType.U7: "u7",
-    TelemetryType.U8: "u8",
+    TelemetryType.eUAVXDJTTelemetry: "DJT Decoder",
+    TelemetryType.eINavLUATelemetry: "LUA Script",
+    TelemetryType.eNoTelemetry: "No Telemetry",
+    TelemetryType.eU4Telemetry: "u4",
+    TelemetryType.eU5Telemetry: "u5",
+    TelemetryType.eU6Telemetry: "u6",
+    TelemetryType.eU7Telemetry: "u7",
+    TelemetryType.eU8Telemetry: "u8",
 }
 
 GPS_PROTOCOL_NAMES = {
@@ -738,29 +1005,29 @@ GPS_PROTOCOL_NAMES = {
 }
 
 RF_TYPE_NAMES = {
-    RangefinderType.MAX_SONAR_CM: "MaxSonar cm",
-    RangefinderType.SRF_I2C_CM: "SRF I2C cm",
-    RangefinderType.MAX_SONAR_I2C_CM: "MaxSonar I2C cm",
-    RangefinderType.SHARP_IR_GP2Y0A02YK: "Sharp IR GP2Y0A02YK",
-    RangefinderType.SHARP_IR_GP2Y0A710K: "Sharp IR GP2Y0A710K",
-    RangefinderType.NO_RF: "No RF",
+    RangefinderType.eMaxSonarcm: "MaxSonar cm",
+    RangefinderType.eSRFI2Ccm: "SRF I2C cm",
+    RangefinderType.eMaxSonarI2Ccm: "MaxSonar I2C cm",
+    RangefinderType.eSharpIRGP2Y0A02YK: "Sharp IR GP2Y0A02YK",
+    RangefinderType.eSharpIRGP2Y0A710K: "Sharp IR GP2Y0A710K",
+    RangefinderType.eNoRF: "No RF",
 }
 
 AS_SENSOR_TYPE_NAMES = {
-    AirspeedSensorType.MS4525D0_I2C: "MPXV7002DP",
-    AirspeedSensorType.MPXV7002DP_ANALOG: "MS425D0 (I2C)",
-    AirspeedSensorType.AS_THERMOPILE_ANALOG: "Thermopile",
-    AirspeedSensorType.AS_GPS_DERIVED: "GPS Derived",
-    AirspeedSensorType.NO_AS: "No Airspeed",
+    AirspeedSensorType.eMS4525D0I2C: "MPXV7002DP",
+    AirspeedSensorType.eMPXV7002DPAnalog: "MS425D0 (I2C)",
+    AirspeedSensorType.eASThermopileAnalog: "Thermopile",
+    AirspeedSensorType.eASGPSDerived: "GPS Derived",
+    AirspeedSensorType.eNoAS: "No Airspeed",
 }
 
 IMU_FILTER_NAMES = {
-    IMUFilterType.LPFILT: "LPFilt",
-    IMUFilterType.MPUFILT: "MPUFilt",
-    IMUFilterType.PT1FILT: "PT1Filt",
-    IMUFilterType.IMU_FILT_3: "F3",
-    IMUFilterType.IMU_FILT_4: "F4",
-    IMUFilterType.IMU_FILT_5: "F5",
+    IMUFilterType.eLP2Filt: "LPFilt",
+    IMUFilterType.eHDLPFilt: "MPUFilt",
+    IMUFilterType.eF1: "PT1Filt",
+    IMUFilterType.eF2: "F3",
+    IMUFilterType.eF3: "F4",
+    IMUFilterType.eF4: "F5",
 }
 
 GYRO_LPF_NAMES = {
@@ -798,4 +1065,10 @@ MOTOR_STOP_NAMES = {
     2: "Descent Rate",
     3: "Accel Bump",
     4: "Rate + Bump",
+}
+
+FAILSAFE_ACTION_NAMES = {
+    0: "RTH",
+    1: "Land",
+    2: "Motors Off",
 }

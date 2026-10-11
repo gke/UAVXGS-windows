@@ -23,6 +23,8 @@ def main():
     # Icon lives in the sibling UAVXGUI folder (XGS.ico).
     here = os.path.dirname(os.path.abspath(__file__))
     icon_candidates = [
+        os.path.join(here, "..", "..", "..", "UAVXGUI", "XGS.png"),
+        os.path.join(here, "XGS.png"),
         os.path.join(here, "..", "..", "..", "UAVXGUI", "XGS.ico"),
         os.path.join(here, "XGS.ico"),
     ]
@@ -33,6 +35,13 @@ def main():
 
     window = MainWindow()
     window.show()
+    # Size the window to exactly fit all content so nothing above the
+    # fixed-height Flags box is compressed at startup.
+    app.processEvents()
+    content = window.centralWidget()
+    need = content.sizeHint()
+    extra = window.frameGeometry().height() - content.height()
+    window.resize(window.width(), need.height() + extra)
 
     sys.exit(app.exec_())
 

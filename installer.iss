@@ -6,7 +6,7 @@
 ; If you moved files, adjust the #define paths below.
 
 #define MyAppName "UAVX Groundstation"
-#define MyAppVersion "0.1.0"
+#define MyAppVersion "0.2.0"
 #define MyAppPublisher "UAVX"
 #define MyAppExeName "UAVX_GCS.exe"
 
@@ -44,8 +44,10 @@ Source: "{#SrcDir}\airframes\*.af"; DestDir: "{app}\airframes"; Flags: ignorever
 Source: "{#SrcDir}\airframes\__init__.py"; DestDir: "{app}\airframes"; Flags: ignoreversion
 Source: "{#SrcDir}\airframes\airframes.py"; DestDir: "{app}\airframes"; Flags: ignoreversion
 
-; FC firmware (for reference/flashing)
-Source: "UAVXF4V3Q_r16.bin"; DestDir: "{app}"; Flags: ignoreversion
+; FC firmware (for reference/flashing) — refresh from the current UAVXArmQ
+; build on every release (obj/UAVXF4V3/UAVXF4V3Q_r<rev>.bin) and keep the
+; filename below in step with it.
+Source: "UAVXF4V3Q_r0.bin"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"

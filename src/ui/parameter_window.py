@@ -1,6 +1,8 @@
 # ui/parameter_window.py - Refactored with enums, no magic numbers
 """
 UAVX Parameter Editor Window
+
+Calibration and flight-safety work 2026-09-27 by OpenCode, Big Pickle & Friends.
 """
 
 import sys
@@ -8,6 +10,7 @@ import os
 from typing import Optional, Dict, List, Tuple
 import time
 import math
+import re
 
 
 from PyQt5.QtWidgets import *
@@ -18,14 +21,16 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from protocol_enums import (
     ParamIndex,
+    PacketTag,
+    MiscCommand,
     RC_MAPPING_NAMES,
     RCControl,
     AirframeType,
     ESCType,
     RxType,
     ArmingMode,
-    TelemetryType,
 
+    RX_TYPE_NAMES,
     RF_TYPE_NAMES,
     AS_SENSOR_TYPE_NAMES,
     IMU_FILTER_NAMES,
@@ -33,14 +38,20 @@ from protocol_enums import (
     ACC_LPF_NAMES,
     BB_LOG_NAMES,
     MOTOR_STOP_NAMES,
-    ACTIVE_AIRFRAMES,
+    FAILSAFE_ACTION_NAMES,
+    ALL_AIRFRAMES,
     AIRFRAME_NAMES,
 )
 from protocol_constants import FlightState, FLIGHT_STATE_NAMES
 from packet_parser import *
 from core.data_manager import data_manager
-from parameters import PARAMETER_DEFS, PARAM_LIMITS, PARAM_TYPES, PARAM_DISPLAY_MULT, PARAM_SCALES, LEGACY_TAGS
+from parameters import PARAMETER_DEFS, PARAM_DEFAULTS, PARAM_LIMITS, PARAM_TYPES, PARAM_DISPLAY_MULT, PARAM_SCALES, LEGACY_TAGS, PID_GAIN_TAGS, PARAM_BOOT_REQUIRED
 from airframes import airframes as af_module
+import workspace
+
+# Nav m/s limits (40 Nav.MaxVelocity, 62 Nav.PosIntLim): not gains — they get a
+# clean 0.1 m/s step / 1 decimal, never the 4-decimal gain treatment.
+ONE_DECIMAL_LIMIT_TAGS = frozenset({40, 62})
 
 
 class TickBar(QWidget):
@@ -90,17 +101,542 @@ class TickBar(QWidget):
 # No hardcoded aircraft templates - only safe default in FC flash and user-exported files
 
 
+class AfSaveDialog(QFileDialog):
+    """Custom file dialog with checkbox to include physics summary in filename"""
+    
+    def __init__(self, parent=None, suggested_name="Params.af", physics_summary="", start_dir=""):
+        super().__init__(parent, "Save Airframe Parameters", suggested_name, "Airframe Files (*.af);;All Files (*)")
+        self.setAcceptMode(QFileDialog.AcceptSave)
+        self.setDefaultSuffix("af")
+        self.setOption(QFileDialog.DontUseNativeDialog, True)
+        if start_dir:
+            self.setDirectory(start_dir)
+        
+        self._physics_summary = physics_summary
+        self._extended_checkbox = QCheckBox("Include physics summary in filename")
+        self._extended_checkbox.setToolTip("Add AUW, prop size, motor count etc. to filename")
+        self._extended_checkbox.stateChanged.connect(self._update_filename)
+        
+        # Add checkbox to dialog layout
+        layout = self.layout()
+        if layout:
+            layout.addWidget(self._extended_checkbox, layout.rowCount(), 0, 1, layout.columnCount())
+        
+        # Initial filename
+        self._base_name = os.path.splitext(suggested_name)[0]
+        self._ext = os.path.splitext(suggested_name)[1] or ".af"
+        self._update_filename()
+    
+    def _update_filename(self):
+        if self._extended_checkbox.isChecked() and self._physics_summary:
+            new_name = f"{self._base_name}_{self._physics_summary}{self._ext}"
+        else:
+            new_name = f"{self._base_name}{self._ext}"
+        self.selectFile(new_name)
+    
+    def get_selected_name(self):
+        return self.selectedFiles()[0] if self.selectedFiles() else ""
+
+
+class AfLoadDialog(QDialog):
+    """Custom file dialog to load .af files with optional physics preview"""
+    
+    def __init__(self, parent=None, start_dir="", classify_fn=None):
+        super().__init__(parent)
+        self.setWindowTitle("Load Airframe Parameters")
+        # Same footprint as the Firmware Flasher sub-window (Greg 2026-09-25).
+        self.setMinimumSize(660, 440)
+        self.resize(660, 440)
+        try:
+            workspace.ensure_dirs()
+        except OSError:
+            pass
+        
+        self._start_dir = start_dir or workspace.airframes_dir()
+        self._user_dir = workspace.airframes_dir()
+        self._contributed_dir = os.path.join(os.path.dirname(__file__), '..', 'airframes', 'contributed')
+        self._proposed_dir = os.path.join(os.path.dirname(__file__), '..', 'airframes', 'proposed')
+        self._generic_dir = os.path.join(os.path.dirname(__file__), '..', 'airframes', 'generic')
+        self._classify_fn = classify_fn  # path -> class label ('MR'/'FW'/...)
+        self._show_physics = True
+        
+        layout = QVBoxLayout(self)
+        
+        # Checkbox
+        self._physics_checkbox = QCheckBox("Show physics summary")
+        self._physics_checkbox.setChecked(True)
+        self._physics_checkbox.setToolTip("Show AUW, prop, motor count etc. for each file")
+        self._physics_checkbox.toggled.connect(lambda checked: self._on_physics_toggled(checked))
+        layout.addWidget(self._physics_checkbox)
+        
+        # Category filter
+        self._filter_combo = QComboBox()
+        self._filter_combo.addItems(["All", "User Airframes", "Generic (Read-Only)", "Contributed (Read-Only)", "Proposed (Read-Only)"])
+        self._filter_combo.currentTextChanged.connect(self._on_filter_changed)
+        layout.addWidget(self._filter_combo)
+        
+        # File list
+        self._list = QListWidget()
+        self._list.setAlternatingRowColors(True)
+        self._list.itemDoubleClicked.connect(self.accept)
+        layout.addWidget(self._list)
+        
+        # Buttons: delete (user files only) + OK/Cancel
+        bottom_row = QHBoxLayout()
+        self._delete_btn = QPushButton("Delete Selected")
+        self._delete_btn.setToolTip("Delete the selected user airframe file")
+        self._delete_btn.setStyleSheet("color: #e74c3c; padding: 4px 12px;")
+        self._delete_btn.clicked.connect(self._delete_selected)
+        bottom_row.addWidget(self._delete_btn)
+        bottom_row.addStretch(1)
+        btn_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btn_box.accepted.connect(self.accept)
+        btn_box.rejected.connect(self.reject)
+        bottom_row.addWidget(btn_box)
+        layout.addLayout(bottom_row)
+        
+        self._populate_list()
+    
+    def _populate_list(self):
+        self._list.clear()
+        filter_text = self._filter_combo.currentText()
+        class_order = {'MR': 0, 'FW': 1, 'VTOL': 2, 'Land': 3, 'Sensor': 4}
+
+        entries = []  # (class_order, -mtime, name_lower, readonly, fname, fpath)
+        def collect(abs_dir, readonly):
+            if not os.path.isdir(abs_dir):
+                return
+            for fname in os.listdir(abs_dir):
+                if not fname.endswith(".af"):
+                    continue
+                fpath = os.path.join(abs_dir, fname)
+                try:
+                    mtime = os.path.getmtime(fpath)
+                except OSError:
+                    mtime = 0.0
+                cls = self._classify(fpath)
+                entries.append((class_order.get(cls, 9), -mtime, fname.lower(),
+                                readonly, fname, fpath))
+
+        if filter_text in ["All", "User Airframes"]:
+            collect(self._user_dir, False)
+        if filter_text in ["All", "Proposed (Read-Only)"]:
+            collect(self._proposed_dir, True)
+        if filter_text in ["All", "Contributed (Read-Only)"]:
+            collect(self._contributed_dir, True)
+        if filter_text in ["All", "Generic (Read-Only)"]:
+            collect(self._generic_dir, True)
+
+        entries.sort(key=lambda r: (r[0], r[1], r[2]))
+
+        last_cls = None
+        for cls_ord, _nm, _low, readonly, fname, fpath in entries:
+            cls = next((c for c, o in class_order.items() if o == cls_ord), 'MR')
+            if cls != last_cls:
+                header_item = QListWidgetItem(f"=== {cls} Airframes ===")
+                header_item.setFlags(header_item.flags() & ~Qt.ItemIsSelectable)
+                header_item.setBackground(QColor("#e0e0e0"))
+                header_item.setForeground(QColor("#333333"))
+                font = header_item.font()
+                font.setBold(True)
+                header_item.setFont(font)
+                self._list.addItem(header_item)
+                last_cls = cls
+
+            prefix = "  [R/O] " if readonly else "  "
+            if self._show_physics:
+                meta = self._parse_physics(fpath)
+                if meta:
+                    parts = []
+                    if meta.get('PHYS_AUW_G'):
+                        parts.append(f"{meta['PHYS_AUW_G']}g")
+                    if meta.get('PHYS_PROP_INCH'):
+                        parts.append(f"{meta['PHYS_PROP_INCH']}in")
+                    if meta.get('PHYS_MOTOR_COUNT'):
+                        parts.append(f"{meta['PHYS_MOTOR_COUNT']}M")
+                    if meta.get('PHYS_WINGSPAN_MM'):
+                        parts.append(f"{meta['PHYS_WINGSPAN_MM']}mm")
+                    info = "  [" + ", ".join(parts) + "]"
+                    self._list.addItem(prefix + fname + info)
+                else:
+                    self._list.addItem(prefix + fname)
+            else:
+                self._list.addItem(prefix + fname)
+            item = self._list.item(self._list.count() - 1)
+            item.setData(Qt.UserRole, fpath)
+            if readonly:
+                item.setForeground(QColor("#888888"))
+                item.setToolTip("Original untuned file (read-only)")
+
+    def _classify(self, path):
+        """Return the airframe class label ('MR'/'FW'/...) for an .af file."""
+        if self._classify_fn is not None:
+            try:
+                return self._classify_fn(path)
+            except Exception:
+                pass
+        return 'MR'
+
+    def _delete_selected(self):
+        """Delete the selected user airframe file after confirmation."""
+        item = self._list.currentItem()
+        if item is None:
+            return
+        path = item.data(Qt.UserRole)
+        if not path:
+            return
+        user_dir_abs = os.path.abspath(self._user_dir)
+        if not os.path.dirname(os.path.abspath(path)).startswith(user_dir_abs):
+            QMessageBox.information(self, "Delete", "Only user airframes can be deleted.")
+            return
+        base = os.path.basename(path)
+        reply = QMessageBox.question(
+            self, "Delete Airframe",
+            f"Delete \"{base}\"?\n\nThis cannot be undone.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+        try:
+            os.remove(path)
+        except OSError as e:
+            QMessageBox.critical(self, "Delete Failed", str(e))
+            return
+        self._populate_list()
+        parent = self.parent()
+        if parent is not None:
+            if getattr(parent, '_current_airframe_path', None) == path:
+                parent._current_airframe_path = None
+            if hasattr(parent, 'status_label'):
+                parent.status_label.setText(f"🗑 Deleted {base}")
+                parent.status_label.setStyleSheet("color: #e74c3c;")
+    
+    def _parse_physics(self, path):
+        try:
+            with open(path) as f:
+                content = f.read()
+            meta = {}
+            for line in content.split('\n'):
+                if line.startswith('PHYS_'):
+                    parts = line.split('=', 1)
+                    if len(parts) == 2:
+                        meta[parts[0].strip()] = parts[1].strip()
+            return meta
+        except:
+            return {}
+    
+    def _refresh_list(self):
+        self._populate_list()
+
+    def _on_physics_toggled(self, checked):
+        self._show_physics = checked
+        self._populate_list()
+
+    def _on_filter_changed(self, text):
+        self._populate_list()
+    
+    def get_selected_path(self):
+        item = self._list.currentItem()
+        return item.data(Qt.UserRole) if item else ""
+
+
 class ParameterWindow(QMainWindow):
     """Parameter editor window - refactored with enums"""
-    
+
+    # Emitted from the sim worker thread; auto-queued to the UI thread.
+    sim_finished = pyqtSignal(bool, list, str, bool)
+
+    # Safety-critical params — require confirmation to change
+    # Physics-computed FW FF params + MC params where wrong values cause crashes
+    _PROTECTED_PARAMS = {
+        # FW FF: physics-computed defaults
+        int(ParamIndex.FW_ROLL_PITCH_FF),
+        int(ParamIndex.FW_PITCH_THROTTLE_FF),
+        int(ParamIndex.FW_AILERON_DIFFERENTIAL),
+        int(ParamIndex.FW_AILERON_RUDDER_MIX),
+        # MC catastrophic: wrong values = crash or damage
+        int(ParamIndex.AF_TYPE),
+        int(ParamIndex.ESC_TYPE),
+        int(ParamIndex.PERCENT_IDLE_THR),
+        int(ParamIndex.CONFIG1_BITS),
+        int(ParamIndex.VOLT_SCALE),
+        int(ParamIndex.SERVO_SENSE),
+    }
+    _PROTECTED_NAMES = {
+        int(ParamIndex.FW_ROLL_PITCH_FF): "FW Roll→Pitch FF",
+        int(ParamIndex.FW_PITCH_THROTTLE_FF): "FW Pitch→Throttle FF",
+        int(ParamIndex.FW_AILERON_DIFFERENTIAL): "FW Aileron Differential",
+        int(ParamIndex.FW_AILERON_RUDDER_MIX): "FW Aileron→Rudder Mix",
+        int(ParamIndex.AF_TYPE): "Airframe Type",
+        int(ParamIndex.ESC_TYPE): "ESC Protocol",
+        int(ParamIndex.PERCENT_IDLE_THR): "Idle Throttle %",
+        int(ParamIndex.CONFIG1_BITS): "Config1 Bits",
+        int(ParamIndex.VOLT_SCALE): "Voltage Scale",
+        int(ParamIndex.SERVO_SENSE): "Servo Sense",
+    }
+    _PROTECTED_WARNINGS = {
+        int(ParamIndex.FW_ROLL_PITCH_FF): "This is a physics-computed default based on your airframe's lift curve.\nWrong values cause poor roll-to-pitch coupling.",
+        int(ParamIndex.FW_PITCH_THROTTLE_FF): "This is a physics-computed default based on your airframe's pitch-trim.\nWrong values cause throttle oscillation in climb/dive.",
+        int(ParamIndex.FW_AILERON_DIFFERENTIAL): "This prevents adverse yaw from aileron deflection.\nWrong values cause uncoordinated turns and yaw oscillation.",
+        int(ParamIndex.FW_AILERON_RUDDER_MIX): "This coordinates rudder with aileron input.\nWrong values cause slipping/skidding turns.",
+        int(ParamIndex.AF_TYPE): "Wrong airframe type selects incorrect mixing.\nThis WILL cause an immediate crash on motor spin-up.",
+        int(ParamIndex.ESC_TYPE): "Wrong ESC protocol means no motor response or random spin.\nMotors may not start or may spin erratically.",
+        int(ParamIndex.PERCENT_IDLE_THR): "Idle throttle too low = motors stop in flight (descent).\nToo high = quad walks on ground and wastes power.",
+        int(ParamIndex.CONFIG1_BITS): "Config bits enable/disable safety features.\nWrong bits can silently disable critical protections.",
+        int(ParamIndex.VOLT_SCALE): "Wrong voltage scale defeats low-voltage battery protection.\nRisk of battery damage or fire from over-discharge.",
+        int(ParamIndex.SERVO_SENSE): "Wrong servo sense reverses control surface direction.\nReversed ailerons = spiral dive. Reversed elevator = loss of pitch control.",
+    }
+
+    # Params the user must configure per-aircraft — highlighted until set to non-default
+    _REQUIRED_SETUP_PARAMS = {
+        int(ParamIndex.AF_TYPE): "Airframe type must match your actual airframe",
+        int(ParamIndex.ESC_TYPE): "ESC protocol must match your ESCs",
+        int(ParamIndex.RF_SENSOR_TYPE): "RF module type must match your radio",
+        int(ParamIndex.AS_SENSOR_TYPE): "Airspeed sensor type (0 = none)",
+        int(ParamIndex.BATTERY_CAPACITY): "Battery capacity in mAh (param stores 0.1 Ah units)",
+        int(ParamIndex.NAV_MAG_VAR): "Magnetic declination in degrees (set to 0 if unsure)",
+        int(ParamIndex.VOLT_SCALE): "Voltage sensor scale — calibrate against multimeter reading",
+        int(ParamIndex.CURRENT_SCALE): "Current sensor scale — calibrate against known load",
+    }
+
+    # Character slider param curves: {param_idx: (conservative_display, aggressive_display)}
+    # Slider 0.0 = conservative (stable, forgiving), 1.0 = aggressive (responsive, tight)
+    # All values in display units — compute_defaults() converts to raw via _display_mult
+    _PARAM_CURVES = {
+        # Character-slider tuning ranges, in DISPLAY units (= raw * PARAM_DISPLAY_MULT).
+        # Authoritative: FC ParamTable defaults (params.c) + test_pid_sim.py curve set.
+        # Endpoints re-anchored Aug 29 to the critic-validated original/ fleet spans
+        # (see wiki/Session_Report_CritiqueRetune_Aug29.md): MR reference = ~800 g /
+        # 220 mm class (Ecks..Rok cluster), whoop-class frames covered by scale factors.
+        # Angle quaternion gains (display = raw, mult 1.0)
+        int(ParamIndex.ROLL_ANGLE_Q_KP):    (5.0, 9.0),      # fleet 5.75–7
+        int(ParamIndex.PITCH_ANGLE_Q_KP):   (5.0, 9.0),      # fleet 5.75–7
+        int(ParamIndex.YAW_ANGLE_Q_KP):     (2.0, 4.5),      # MR fleet 2.25–3.0 (FW overrides — Phoenix 7.68)
+        # Angle integral gains (mult 1.0)
+        int(ParamIndex.ROLL_ANGLE_Q_KI):    (0.05, 0.5),     # fleet 0.1–0.25
+        int(ParamIndex.PITCH_ANGLE_Q_KI):   (0.05, 0.5),
+        int(ParamIndex.YAW_ANGLE_Q_KI):     (0.05, 0.5),     # fleet 0.25 (FW overrides — Phoenix 0.64)
+        # Angle integral limits (rad/s, mult 1.0)
+        int(ParamIndex.ROLL_ANGLE_Q_INT_LIMIT): (0.005, 0.03),
+        int(ParamIndex.PITCH_ANGLE_Q_INT_LIMIT): (0.005, 0.03),
+        int(ParamIndex.YAW_ANGLE_Q_INT_LIMIT): (0.01, 0.06),
+        # Rate proportional gains (mult 1.0)
+        int(ParamIndex.ROLL_RATE_KP):     (0.125, 0.5),      # fleet 0.2–0.45 (flat across 30–1344 g)
+        int(ParamIndex.PITCH_RATE_KP):    (0.125, 0.5),
+        int(ParamIndex.YAW_RATE_KP):      (0.08, 0.15),      # ~800 g cluster 0.09–0.10; whoop sf≈4 → ~0.6
+        # Rate derivative gains (mult 1.0)
+        int(ParamIndex.ROLL_RATE_KD):     (0.002, 0.012),    # fleet 0.002–0.010 (was 0.005–0.02 — stale)
+        int(ParamIndex.PITCH_RATE_KD):    (0.002, 0.012),
+        int(ParamIndex.YAW_RATE_KD):      (0.0002, 0.001),   # fleet 0.0003375–0.00066 (was 0.005–0.02 — 15–60× stale)
+        # Rate limits (rad->deg/s, mult 57.3)
+        int(ParamIndex.MAX_ROLL_RATE):    (80.0, 450.0),     # fleet 210–420 (S500) — was 360
+        int(ParamIndex.MAX_PITCH_RATE):   (60.0, 420.0),
+        int(ParamIndex.MAX_HEADING_RATE): (15.0, 120.0),     # fleet 60–90
+        # Altitude (alt params are NOT mass-scaled — fleet runs 1.83/0.005 flat)
+        int(ParamIndex.ALT_POS_KP):       (1.0, 2.5),        # fleet 1.83 (was 0.2–0.5 — refused own fleet)
+        int(ParamIndex.ALT_POS_KI):       (0.001, 0.005),
+        int(ParamIndex.ALT_THROTTLE_COMP_LIMIT): (10.0, 25.0),   # mult 100 — mirrors FC pMaxAltHoldThrComp default 0.25 (aggressive end); min 10% = usable alt authority
+        int(ParamIndex.ALT_ROC_KP):       (0.02, 1.5),       # fleet 0.05–1.0
+        int(ParamIndex.UNUSED_ALT_VEL_KI): (0.0003, 0.003),
+        # Navigation
+        int(ParamIndex.NAV_POS_KP):       (0.075, 0.3),
+        int(ParamIndex.NAV_POS_KI):       (0.006, 0.025),
+        int(ParamIndex.NAV_POS_INT_LIM):  (0.2, 2.0),
+        int(ParamIndex.NAV_VEL_KP):       (0.1, 0.4),
+        int(ParamIndex.HORIZON):          (20.0, 50.0),
+        # Angle limits (rad->deg, mult 57.3) — fleet runs 60° = the FC eClassAngle ceiling
+        int(ParamIndex.MAX_PITCH_ANGLE):  (30.0, 60.0),
+        int(ParamIndex.MAX_ROLL_ANGLE):   (30.0, 60.0),
+    }
+
+    # FW category overrides on top of _PARAM_CURVES (MR reference above).
+    # Evidence: Phoenix — YawAngleQKp 7.68, YawAngleQKi 0.64, YawRateKp 0.285.
+    # FW bank = ROLL angle (coordinated turn); pitch max stays a climb-attitude
+    # limit, so the two differ for FW (user decision 2026-08-29: bank ≤ 45°).
+    _PARAM_CURVES_FW = {
+        int(ParamIndex.YAW_ANGLE_Q_KP):   (5.0, 10.0),
+        int(ParamIndex.YAW_ANGLE_Q_KI):   (0.1, 0.8),
+        int(ParamIndex.YAW_RATE_KP):      (0.2, 0.4),
+        int(ParamIndex.MAX_ROLL_ANGLE):   (20.0, 45.0),
+        int(ParamIndex.MAX_PITCH_ANGLE):  (7.0, 15.0),   # ~1/3 of max bank (FW ratio, 2026-08-29 decision)
+    }
+
+    # Physical descriptor definitions for Setup row (dynamic per AF category)
+    # Each entry: (metadata_key, label, decimals, default, tooltip)
+    _MR_PHYS_DESCRIPTORS = [
+        ("PHYS_AUW_G",      "AUW (g)",         0, 800,    "All-up weight in grams — weigh the aircraft on a scale"),
+        ("PHYS_ARM_MM",     "Arm (mm)",        0, 220,    "Motor shaft to center distance"),
+        ("PHYS_MOTOR_THRUST_G","Thrust (g)",   0, 300,    "Max thrust per motor in grams"),
+        ("PHYS_PROP",       "Prop",            None, "11x4.5", "Prop diameter × pitch (× blades), e.g. 10x6 or 5x4.3x3"),
+        ("PHYS_MOTOR_THRUST_A","Curr (A)",     1, 20.0,   "Max current per motor in amps"),
+        ("PHYS_MOTOR_THRUST_V","Volt (V)",     1, 14.8,   "Motor voltage (e.g. 3S=11.1, 4S=14.8, 6S=22.2)"),
+        ("PHYS_MOTOR_COUNT","Motors",          0, 4,      "Number of motors"),
+    ]
+    _FW_PHYS_DESCRIPTORS = [
+        ("PHYS_AUW_G",       "AUW (g)",        0, 1000,  "All-up weight in grams — weigh the aircraft on a scale"),
+        ("PHYS_WINGSPAN_MM", "Wing (mm)",      0, 1800,  "Wingtip to wingtip"),
+        ("PHYS_MOTOR_THRUST_G","Thrust (g)",   0, 800,   "Max thrust per motor in grams"),
+        ("PHYS_CHORD_MM",    "Chord (mm)",     0, 250,   "Average root chord"),
+        ("PHYS_PROP",        "Prop",           None, "10x5", "Prop diameter × pitch (× blades), e.g. 10x6 or 5x4.3x3"),
+        ("PHYS_MOTOR_THRUST_A","Curr (A)",     1, 30.0,  "Max current per motor in amps"),
+        ("PHYS_MOTOR_THRUST_V","Volt (V)",     1, 14.8,  "Motor voltage (e.g. 3S=11.1, 4S=14.8, 6S=22.2)"),
+        ("PHYS_BATT_V",      "Batt V",         1, 50.0,  "Battery voltage under load (e.g. 3S=11.1, 4S=14.8)"),
+    ]
+    _LAND_PHYS_DESCRIPTORS = [
+        ("PHYS_AUW_G",       "AUW (g)",        0, 5000,  "All-up weight in grams — weigh the vehicle on a scale"),
+        ("PHYS_TRACK_MM",    "Track/WB (mm)",  0, 300,   "Track width or wheelbase in mm"),
+        ("PHYS_WHEEL_DIA",   "Wheel dia (mm)", 0, 100,   "Drive wheel diameter in mm"),
+    ]
+
+    # Hover throttle sanity bounds
+    # Hover throttle: 45-55% is ideal (equal climb/descent margin)
+    # Warning outside 25-75% catches genuinely wrong inputs
+    _HOVER_THR_MIN = 0.25
+    _HOVER_THR_MAX = 0.75
+
+    # MR shape factors for inertia from arm length
+    _MR_SHAPE_KF = {4: 0.55, 6: 0.50, 8: 0.45}
+
+    # Motor count lookup from AF type (MR only)
+    _MR_MOTOR_COUNT = {
+        3: 4, 4: 4, 5: 4, 6: 4,   # QUAD, QUAD_X, QUAD_COAX, QUAD_COAX_X
+        7: 6, 8: 6,                 # HEX, HEX_X
+        9: 8, 10: 8,                # OCT, OCT_X
+    }
+
+    # Airframe-specific physics defaults (matching generic .af files)
+    _MR_PHYS_DEFAULTS = {
+        4: [  # Quad (standard 5-6")
+            ("PHYS_AUW_G",      "AUW (g)",         0, 750,   "All-up weight in grams — weigh the aircraft on a scale"),
+            ("PHYS_ARM_MM",     "Arm (mm)",        0, 180,   "Motor shaft to center distance"),
+            ("PHYS_MOTOR_THRUST_G","Thrust (g)",   0, 300,   "Max thrust per motor in grams"),
+            ("PHYS_PROP",       "Prop",            None, "6x4.5", "Prop diameter × pitch (× blades), e.g. 10x6 or 5x4.3x3"),
+            ("PHYS_MOTOR_THRUST_A","Curr (A)",     1, 25.0,  "Max current per motor in amps"),
+            ("PHYS_MOTOR_THRUST_V","Volt (V)",     1, 14.8,  "Motor voltage (e.g. 3S=11.1, 4S=14.8, 6S=22.2)"),
+            ("PHYS_MOTOR_COUNT","Motors",          0, 4,     "Number of motors"),
+        ],
+        5: [  # Quad_Medium (7" long-range)
+            ("PHYS_AUW_G",      "AUW (g)",         0, 1000,  "All-up weight in grams — weigh the aircraft on a scale"),
+            ("PHYS_ARM_MM",     "Arm (mm)",        0, 175,   "Motor shaft to center distance"),
+            ("PHYS_MOTOR_THRUST_G","Thrust (g)",   0, 500,   "Max thrust per motor in grams"),
+            ("PHYS_PROP",       "Prop",            None, "7x4.5", "Prop diameter × pitch (× blades), e.g. 10x6 or 5x4.3x3"),
+            ("PHYS_MOTOR_THRUST_A","Curr (A)",     1, 20.0,  "Max current per motor in amps"),
+            ("PHYS_MOTOR_THRUST_V","Volt (V)",     1, 14.8,  "Motor voltage (e.g. 3S=11.1, 4S=14.8, 6S=22.2)"),
+            ("PHYS_MOTOR_COUNT","Motors",          0, 4,     "Number of motors"),
+        ],
+        6: [  # Quad_Racer (5" racer)
+            ("PHYS_AUW_G",      "AUW (g)",         0, 450,   "All-up weight in grams — weigh the aircraft on a scale"),
+            ("PHYS_ARM_MM",     "Arm (mm)",        0, 115,   "Motor shaft to center distance"),
+            ("PHYS_MOTOR_THRUST_G","Thrust (g)",   0, 500,   "Max thrust per motor in grams"),
+            ("PHYS_PROP",       "Prop",            None, "5x5", "Prop diameter × pitch (× blades), e.g. 10x6 or 5x4.3x3"),
+            ("PHYS_MOTOR_THRUST_A","Curr (A)",     1, 35.0,  "Max current per motor in amps"),
+            ("PHYS_MOTOR_THRUST_V","Volt (V)",     1, 14.8,  "Motor voltage (e.g. 3S=11.1, 4S=14.8, 6S=22.2)"),
+            ("PHYS_MOTOR_COUNT","Motors",          0, 4,     "Number of motors"),
+        ],
+        7: [  # Hex
+            ("PHYS_AUW_G",      "AUW (g)",         0, 1200,  "All-up weight in grams — weigh the aircraft on a scale"),
+            ("PHYS_ARM_MM",     "Arm (mm)",        0, 275,   "Motor shaft to center distance"),
+            ("PHYS_MOTOR_THRUST_G","Thrust (g)",   0, 700,   "Max thrust per motor in grams"),
+            ("PHYS_PROP",       "Prop",            None, "11x5", "Prop diameter × pitch (× blades), e.g. 10x6 or 5x4.3x3"),
+            ("PHYS_MOTOR_THRUST_A","Curr (A)",     1, 15.0,  "Max current per motor in amps"),
+            ("PHYS_MOTOR_THRUST_V","Volt (V)",     1, 14.8,  "Motor voltage (e.g. 3S=11.1, 4S=14.8, 6S=22.2)"),
+            ("PHYS_MOTOR_COUNT","Motors",          0, 6,     "Number of motors"),
+        ],
+        8: [  # Oct
+            ("PHYS_AUW_G",      "AUW (g)",         0, 1600,  "All-up weight in grams — weigh the aircraft on a scale"),
+            ("PHYS_ARM_MM",     "Arm (mm)",        0, 300,   "Motor shaft to center distance"),
+            ("PHYS_MOTOR_THRUST_G","Thrust (g)",   0, 800,   "Max thrust per motor in grams"),
+            ("PHYS_PROP",       "Prop",            None, "12x6", "Prop diameter × pitch (× blades), e.g. 10x6 or 5x4.3x3"),
+            ("PHYS_MOTOR_THRUST_A","Curr (A)",     1, 20.0,  "Max current per motor in amps"),
+            ("PHYS_MOTOR_THRUST_V","Volt (V)",     1, 22.2,  "Motor voltage (e.g. 3S=11.1, 4S=14.8, 6S=22.2)"),
+            ("PHYS_MOTOR_COUNT","Motors",          0, 8,     "Number of motors"),
+        ],
+    }
+
+    _FW_PHYS_DEFAULTS = {
+        13: [  # ELEVON
+            ("PHYS_AUW_G",       "AUW (g)",        0, 650,  "All-up weight in grams — weigh the aircraft on a scale"),
+            ("PHYS_WINGSPAN_MM", "Wing (mm)",      0, 850,  "Wingtip to wingtip"),
+            ("PHYS_MOTOR_THRUST_G","Thrust (g)",   0, 400,  "Max thrust per motor in grams"),
+            ("PHYS_CHORD_MM",    "Chord (mm)",     0, 180,  "Average root chord"),
+            ("PHYS_PROP",        "Prop",           None, "8x5", "Prop diameter × pitch (× blades), e.g. 10x6 or 5x4.3x3"),
+            ("PHYS_MOTOR_THRUST_A","Curr (A)",     1, 20.0, "Max current per motor in amps"),
+            ("PHYS_MOTOR_THRUST_V","Volt (V)",     1, 11.1, "Motor voltage (e.g. 3S=11.1, 4S=14.8, 6S=22.2)"),
+            ("PHYS_BATT_V",      "Batt V",         1, 11.1, "Battery voltage under load (e.g. 3S=11.1, 4S=14.8)"),
+        ],
+        14: [  # DELTA
+            ("PHYS_AUW_G",       "AUW (g)",        0, 550,  "All-up weight in grams — weigh the aircraft on a scale"),
+            ("PHYS_WINGSPAN_MM", "Wing (mm)",      0, 850,  "Wingtip to wingtip"),
+            ("PHYS_MOTOR_THRUST_G","Thrust (g)",   0, 300,  "Max thrust per motor in grams"),
+            ("PHYS_CHORD_MM",    "Chord (mm)",     0, 280,  "Average root chord"),
+            ("PHYS_PROP",        "Prop",           None, "6.5x4", "Prop diameter × pitch (× blades), e.g. 10x6 or 5x4.3x3"),
+            ("PHYS_MOTOR_THRUST_A","Curr (A)",     1, 20.0, "Max current per motor in amps"),
+            ("PHYS_MOTOR_THRUST_V","Volt (V)",     1, 11.1, "Motor voltage (e.g. 3S=11.1, 4S=14.8, 6S=22.2)"),
+            ("PHYS_BATT_V",      "Batt V",         1, 11.1, "Battery voltage under load (e.g. 3S=11.1, 4S=14.8)"),
+        ],
+        15: [  # AILERON
+            ("PHYS_AUW_G",       "AUW (g)",        0, 1200, "All-up weight in grams — weigh the aircraft on a scale"),
+            ("PHYS_WINGSPAN_MM", "Wing (mm)",      0, 1200, "Wingtip to wingtip"),
+            ("PHYS_MOTOR_THRUST_G","Thrust (g)",   0, 800,  "Max thrust per motor in grams"),
+            ("PHYS_CHORD_MM",    "Chord (mm)",     0, 220,  "Average root chord"),
+            ("PHYS_PROP",        "Prop",           None, "10x6", "Prop diameter × pitch (× blades), e.g. 10x6 or 5x4.3x3"),
+            ("PHYS_MOTOR_THRUST_A","Curr (A)",     1, 30.0, "Max current per motor in amps"),
+            ("PHYS_MOTOR_THRUST_V","Volt (V)",     1, 14.8, "Motor voltage (e.g. 3S=11.1, 4S=14.8, 6S=22.2)"),
+            ("PHYS_BATT_V",      "Batt V",         1, 14.8, "Battery voltage under load (e.g. 3S=11.1, 4S=14.8)"),
+        ],
+        18: [  # RUDDER_ELEVATOR
+            ("PHYS_AUW_G",       "AUW (g)",        0, 900,  "All-up weight in grams — weigh the aircraft on a scale"),
+            ("PHYS_WINGSPAN_MM", "Wing (mm)",      0, 1380, "Wingtip to wingtip"),
+            ("PHYS_MOTOR_THRUST_G","Thrust (g)",   0, 600,  "Max thrust per motor in grams"),
+            ("PHYS_CHORD_MM",    "Chord (mm)",     0, 220,  "Average root chord"),
+            ("PHYS_PROP",        "Prop",           None, "10x6", "Prop diameter × pitch (× blades), e.g. 10x6 or 5x4.3x3"),
+            ("PHYS_MOTOR_THRUST_A","Curr (A)",     1, 25.0, "Max current per motor in amps"),
+            ("PHYS_MOTOR_THRUST_V","Volt (V)",     1, 14.8, "Motor voltage (e.g. 3S=11.1, 4S=14.8, 6S=22.2)"),
+            ("PHYS_BATT_V",      "Batt V",         1, 11.1, "Battery voltage under load (e.g. 3S=11.1, 4S=14.8)"),
+        ],
+        16: [  # AILERON_SPOILER_FLAPS
+            ("PHYS_AUW_G",       "AUW (g)",        0, 1000, "All-up weight in grams — weigh the aircraft on a scale"),
+            ("PHYS_WINGSPAN_MM", "Wing (mm)",      0, 1100, "Wingtip to wingtip"),
+            ("PHYS_MOTOR_THRUST_G","Thrust (g)",   0, 700,  "Max thrust per motor in grams"),
+            ("PHYS_CHORD_MM",    "Chord (mm)",     0, 200,  "Average root chord"),
+            ("PHYS_PROP",        "Prop",           None, "9x5", "Prop diameter × pitch (× blades), e.g. 10x6 or 5x4.3x3"),
+            ("PHYS_MOTOR_THRUST_A","Curr (A)",     1, 25.0, "Max current per motor in amps"),
+            ("PHYS_MOTOR_THRUST_V","Volt (V)",     1, 14.8, "Motor voltage (e.g. 3S=11.1, 4S=14.8, 6S=22.2)"),
+            ("PHYS_BATT_V",      "Batt V",         1, 14.8, "Battery voltage under load (e.g. 3S=11.1, 4S=14.8)"),
+        ],
+    }
+
+    _LAND_PHYS_DEFAULTS = {
+        22: [  # TRACKED
+            ("PHYS_AUW_G",       "AUW (g)",        0, 5000, "All-up weight in grams — weigh the vehicle on a scale"),
+            ("PHYS_TRACK_MM",    "Track/WB (mm)",  0, 300,  "Track width or wheelbase in mm"),
+            ("PHYS_WHEEL_DIA",   "Wheel dia (mm)", 0, 100,  "Drive wheel diameter in mm"),
+        ],
+    }
+
+    # Default base curves (unscaled) for computing scale factors
+    # These represent a "reference" MR at 800g AUW, 220mm arm, 1000kv, 11"
+    _REF_MR_AUW_G = 800
+    _REF_MR_ARM_MM = 220
+    _REF_MR_PROP_INCH = 11.0
+    _REF_FW_AUW_G = 1000
+    _REF_FW_WINGSPAN_MM = 1800
+
     # Parameter groups defined with enums
+    # Yaw angle Ki/Kp is a separate tight fleet constant (0.083 across all
+    # cohorts and both tuning generations) — yaw's Qa gain-to-rate authority
+    # differs from roll/pitch (0.026). Unlike roll/pitch there is NO yaw
+    # angle-max input (heading is unbounded through 360°), so yaw QAngleKp
+    # is not derivable from Max Heading Rate; only yaw Ki is derived.
+    _YAW_ANGLE_KI_KP_RATIO = 0.083
+
     PID_PARAMS = [
-        ("Q Angle", ParamIndex.ROLL_ANGLE_KP, ParamIndex.PITCH_ANGLE_KP, ParamIndex.YAW_ANGLE_KP, 7.0, 7.0, 3.0),
-        ("Ki Angle", ParamIndex.ROLL_ANGLE_KI, ParamIndex.PITCH_ANGLE_KI, ParamIndex.YAW_ANGLE_KI, 3, 3, 3),
-        ("I-Limit", ParamIndex.ROLL_ANGLE_INT_LIMIT, ParamIndex.PITCH_ANGLE_INT_LIMIT, ParamIndex.YAW_ANGLE_INT_LIMIT, 10, 10, 10),
-        ("Kp Rate", ParamIndex.ROLL_RATE_KP, ParamIndex.PITCH_RATE_KP, ParamIndex.YAW_RATE_KP, 0.30, 0.45, 0.75),
-        ("Kd Rate", ParamIndex.ROLL_RATE_KD, ParamIndex.PITCH_RATE_KD, ParamIndex.YAW_RATE_KD, 0.015, 0.0225, 0.0375),
-        ("Max Rate (Deg/Sec)", ParamIndex.MAX_ROLL_RATE, ParamIndex.MAX_PITCH_RATE, ParamIndex.MAX_COMPASS_YAW_RATE, 240, 120, 120),
+        ("Q Angle", ParamIndex.ROLL_ANGLE_Q_KP, ParamIndex.PITCH_ANGLE_Q_KP, ParamIndex.YAW_ANGLE_Q_KP, 7.0, 7.0, 3.0),
+        ("Ki Angle", ParamIndex.ROLL_ANGLE_Q_KI, ParamIndex.PITCH_ANGLE_Q_KI, ParamIndex.YAW_ANGLE_Q_KI, 0.25, 0.25, 0.25),
+        ("I-Limit", ParamIndex.ROLL_ANGLE_Q_INT_LIMIT, ParamIndex.PITCH_ANGLE_Q_INT_LIMIT, ParamIndex.YAW_ANGLE_Q_INT_LIMIT, 0.002618, 0.002618, 0.008727),
+        ("Kp Rate", ParamIndex.ROLL_RATE_KP, ParamIndex.PITCH_RATE_KP, ParamIndex.YAW_RATE_KP, 0.1, 0.1, 0.1),
+        ("Kd Rate", ParamIndex.ROLL_RATE_KD, ParamIndex.PITCH_RATE_KD, ParamIndex.YAW_RATE_KD, 0.0045, 0.0045, 0.001125),
+        ("Max Rate (Deg/Sec)", ParamIndex.MAX_ROLL_RATE, ParamIndex.MAX_PITCH_RATE, ParamIndex.MAX_HEADING_RATE, 600, 600, 60),
     ]
     
     RC_MAP_PARAMS = [
@@ -108,67 +644,87 @@ class ParameterWindow(QMainWindow):
         (ParamIndex.RX_ROLL_CH, "Roll", 1),
         (ParamIndex.RX_PITCH_CH, "Pitch", 2),
         (ParamIndex.RX_YAW_CH, "Yaw", 3),
-        (ParamIndex.RX_GEAR_CH, "NavMode", 4),
+        (ParamIndex.RX_AUX2_CH, "Arming", 4),
         (ParamIndex.RX_AUX1_CH, "AttMode", 5),
-        (ParamIndex.RX_AUX2_CH, "NavQual", 6),
-        (ParamIndex.RX_AUX3_CH, "CamPitch", 10),
-        (ParamIndex.RX_AUX4_CH, "Aux2", 8),
-        (ParamIndex.RX_AUX5_CH, "Transition", 9),
+        (ParamIndex.RX_GEAR_CH, "NavMode", 6),
         (ParamIndex.RX_AUX6_CH, "PassThru", 7),
-        (ParamIndex.RX_AUX7_CH, "Dive", 11),
+        (ParamIndex.RX_AUX7_CH, "Dive", 8),
+        (ParamIndex.RX_AUX4_CH, "Trace", 9),
+        (ParamIndex.RX_AUX5_CH, "RateGain", 10),
+        (ParamIndex.RX_AUX3_CH, "CamPitch", 11),
     ]
+
+    # RC-config channel-slot spin style (0-based slot in the discovered frame)
+    RC_CH_STYLE = """
+        QSpinBox { padding: 1px 2px; }
+        QSpinBox::up-button, QSpinBox::down-button { width: 12px; }
+    """
+    # Red = that channel is not present in the receiver's frame. Distinct from
+    # duplicate, which is amber: one is a fact about the link, the other is a
+    # clash the pilot created and the FC will refuse (F.RCMapFail blocks arming).
+    RC_CH_BAD_STYLE = """
+        QSpinBox { padding: 1px 2px; background-color: #e74c3c; color: white; }
+        QSpinBox::up-button, QSpinBox::down-button { width: 12px; }
+    """
+    RC_CH_DUP_STYLE = """
+        QSpinBox { padding: 1px 2px; background-color: #e67e22; color: white; }
+        QSpinBox::up-button, QSpinBox::down-button { width: 12px; }
+    """
     
     ALTITUDE_PARAMS = [
-        (ParamIndex.ALT_POS_KP, "Kp Alt", 28),
-        (ParamIndex.ALT_POS_KI, "Ki Alt", 10),
-        (ParamIndex.ALT_POS_INT_LIMIT, "I-Limit", 10),
-        (ParamIndex.MAX_YAW_RATE, "Max ROC (m/s)", 2),  # MAX_YAW_RATE is used for Max ROC in params.h
-        (ParamIndex.ALT_LPF, "Alt LPF (Hz)", 5),
-        (ParamIndex.ALT_HOLD_THR_COMP_DECAY_PERCENT_PS, "Thr Decay (%/s)", 3),
-        (ParamIndex.ALT_THROTTLE_COMP_LIMIT, "Thr Comp Limit", 20),
-        (ParamIndex.AH_THROTTLE_MOVING_TRIGGER, "Thr Move Trig", 10),
-    ]
-    
-    NAVIGATION_PARAMS = [
-        (ParamIndex.NAV_POS_KP, "Kp Pos", 20),
-        (ParamIndex.NAV_POS_KI, "Ki Pos", 5),
-        (ParamIndex.NAV_VEL_KP, "Kp Vel", 20),
-        (ParamIndex.NAV_POS_INT_LIMIT, "Max Vel (m/s)", 3),
-        (ParamIndex.NAV_MAX_ANGLE, "Max Angle (Deg)", 30),
-        (ParamIndex.NAV_RTH_ALT, "RTH Alt (m)", 15),
-        (ParamIndex.NAV_MAG_VAR, "Mag Var (Deg)", 12.8),
-        (ParamIndex.NAV_CROSS_TRACK_KP, "XTrack Kp", 4),
-        (ParamIndex.NAV_HEADING_TURNOUT, "Heading Turnout", 50),
-        (ParamIndex.MAX_COMPASS_YAW_RATE, "Max Yaw Rate (°/s)", 30),
-        (ParamIndex.NAV_PROX_ALT_M, "Prox Alt (m)", 4),
-        (ParamIndex.NAV_PROX_RADIUS_M, "Prox Radius (m)", 3),
-        (ParamIndex.NAV_FENCE_RADIUS_M, "Fence Rad (m)", 100),
-        (ParamIndex.EST_CRUISE_THR, "Cruise Thr (%)", 45),
-        (ParamIndex.DESCENT_DELAY_S, "Land Delay (s)", 15),
-        (ParamIndex.MAX_DESCENT_RATE_DMP_S, "Land Rate (m/s)", 7),
-        (ParamIndex.MOTOR_STOP_SEL, "Motor Stop", 0, list(MOTOR_STOP_NAMES.values())),
+        (ParamIndex.ALT_POS_KP, "Kp Alt", 0.25),
+        (ParamIndex.ALT_POS_KI, "Ki Alt", 0.0046),
+        (ParamIndex.ALT_POS_INT_LIMIT, "I-Limit", 0.5),
+        (ParamIndex.ALT_ROC_KP, "Kp ROC", 0.05),
+        (ParamIndex.UNUSED_ALT_VEL_KI, "Ki ROC", 0.001),
+        (ParamIndex.ALT_LPF, "Alt LPF (Hz)", 10),
+        (ParamIndex.ALT_HOLD_THR_COMP_DECAY_PERCENT_PS, "Thr Decay (%/s)", 25),
+        (ParamIndex.ALT_THROTTLE_COMP_LIMIT, "Thr Comp Limit (%)", 25),
+        (ParamIndex.AH_THROTTLE_MOVING_TRIGGER, "Thr Move Trig (%)", 2),
         (ParamIndex.VRS_ROC, "VRS ROC (m/s)", 3),
         (ParamIndex.AH_ROC_WINDOW_MPS, "AH ROC Win (m/s)", 1),
     ]
     
+    NAVIGATION_PARAMS = [
+        (ParamIndex.NAV_POS_KP, "Kp Pos", 0.22),
+        (ParamIndex.NAV_POS_KI, "Ki Pos", 0.012),
+        (ParamIndex.NAV_POS_INT_LIM, "I-Limit (m/s)", 1.0),
+        (ParamIndex.NAV_VEL_KP, "Kp Vel", 0.25),
+        (ParamIndex.NAV_POS_INT_LIMIT, "Max Vel (m/s)", 5),
+        (ParamIndex.NAV_MAX_ANGLE, "Max Angle (Deg)", 25),
+        (ParamIndex.NAV_RTH_ALT, "RTH Alt (m)", 10),
+        (ParamIndex.NAV_MAG_VAR, "Mag Var (Deg)", 12.8),
+        (ParamIndex.NAV_CROSS_TRACK_KP, "XTrack Kp", 0.04),
+        (ParamIndex.NAV_HEADING_TURNOUT, "Heading Turnout", 20),
+        (ParamIndex.MAX_HEADING_RATE, "Max Heading Rate (°/s)", 30),
+        (ParamIndex.NAV_PROX_ALT_M, "Prox Alt (m)", 4),
+        (ParamIndex.NAV_PROX_RADIUS_M, "Prox Radius (m)", 3),
+        (ParamIndex.NAV_FENCE_RADIUS_M, "Fence Rad (m)", 200),
+        (ParamIndex.DESCENT_DELAY_S, "Land Delay (s)", 15),
+        (ParamIndex.MAX_DESCENT_RATE_MP_S, "Descent Shape (m/s)", 3),
+        (ParamIndex.MAX_CLIMB_RATE_MP_S, "Climb Shape (m/s)", 3),
+        (ParamIndex.SPIRAL_DESCENT_BAND_M, "Spiral Band (m)", 3),
+        (ParamIndex.MOTOR_STOP_SEL, "Motor Stop", 0, list(MOTOR_STOP_NAMES.values())),
+        (ParamIndex.BB_LOG_TYPE, "BB Log", 0, list(BB_LOG_NAMES.values())),
+    ]
+    
     GENERAL_PARAMS = [
-        (ParamIndex.AF_TYPE, "Airframe", 4, [AIRFRAME_NAMES[af] for af in sorted(ACTIVE_AIRFRAMES, key=lambda x: AIRFRAME_NAMES[x].lower())], [af.value for af in sorted(ACTIVE_AIRFRAMES, key=lambda x: AIRFRAME_NAMES[x].lower())]),
+        (ParamIndex.AF_TYPE, "Airframe", 4, [AIRFRAME_NAMES[af] for af in ALL_AIRFRAMES], [af.value for af in ALL_AIRFRAMES]),
         (ParamIndex.ESC_TYPE, "ESC Type", 2, list(ESC_TYPE_NAMES.values())),
         (ParamIndex.RX_TYPE, "Rx Type", 0, list(RX_TYPE_NAMES.values())),
         (ParamIndex.ARMING_MODE, "Arming Mode", 1, list(ARMING_MODE_NAMES.values())),
-        (ParamIndex.TELEMETRY_TYPE, "Telemetry", 1, list(TELEMETRY_TYPE_NAMES.values())),
         (ParamIndex.RF_SENSOR_TYPE, "RF Type", 0, list(RF_TYPE_NAMES.values())),
         (ParamIndex.AS_SENSOR_TYPE, "Airspeed", 4, list(AS_SENSOR_TYPE_NAMES.values())),
-        (ParamIndex.PERCENT_IDLE_THR, "Idle Thr (%)", 10),
-        (ParamIndex.STICK_HYSTERESIS, "Hysteresis", 2),
+        (ParamIndex.BALANCE, "Balance (%)", 0),
+        (ParamIndex.HORIZON, "Horizon (%)", 0.3),
     ]
 
     GENERAL_CAMERA_PARAMS = [
-        (ParamIndex.ROLL_CAM_KP, "Roll Cam Kp", 50),
-        (ParamIndex.PITCH_CAM_KP, "Pitch Cam Kp", 50),
+        (ParamIndex.ROLL_CAM_KP, "Roll Cam Kp", 1.0),
+        (ParamIndex.PITCH_CAM_KP, "Pitch Cam Kp", 1.0),
         (ParamIndex.ROLL_CAM_TRIM, "Roll Cam Trim", 0),
-        (ParamIndex.SERVO_SENSE, "Servo Sense", 0),
-        (ParamIndex.BB_LOG_TYPE, "BB Log", 0, list(BB_LOG_NAMES.values())),
+        (ParamIndex.PERCENT_IDLE_THR, "Idle Thr (%)", 5.0),
+        (ParamIndex.STICK_HYSTERESIS, "Hysteresis (%)", 2),
     ]
     
     FILTER_PARAMS = [
@@ -181,11 +737,9 @@ class ParameterWindow(QMainWindow):
     ]
     
     ESTIMATOR_PARAMS = [
-        (ParamIndex.MADGWICK_KP_MAG, "Kp Mag", 50),
-        (ParamIndex.MADGWICK_KP_ACC, "Kp Acc", 20),
-        (ParamIndex.ACC_CONF_SD, "Acc Conf (SD)", 4),
-        (ParamIndex.HORIZON, "Horizon", 30),
-        (ParamIndex.TILT_THROTTLE_FF, "Tilt Thr (%)", 25),
+        (ParamIndex.MADGWICK_KP_MAG, "Kp Mag", 0.5),
+        (ParamIndex.MADGWICK_KP_ACC, "Kp Acc", 0.4),
+        (ParamIndex.ACC_CONF_SD, "Acc Conf (SD)", 16.67),
     ]
     
     MISC1_PARAMS = []
@@ -194,29 +748,33 @@ class ParameterWindow(QMainWindow):
         (ParamIndex.LOW_VOLT_THRES, "Low Volt (V)", 16),
         (ParamIndex.VOLT_SCALE, "Volt Scale", 19),
         (ParamIndex.CURRENT_SCALE, "Curr Scale", 0),
-        (ParamIndex.BATTERY_CAPACITY, "Batt mAH", 2200),
+        (ParamIndex.BATTERY_CAPACITY, "Batt mAH", 1500),
         (ParamIndex.THROTTLE_GAIN_RATE, "Thr Gain (%)", 0),
     ]
     
     FW_PARAMS = [
-        (ParamIndex.FW_MAX_CLIMB_ANGLE, "Climb Angle (Deg)", 10),
-        (ParamIndex.BALANCE, "Trim Angle (Deg)", 5),
-        (ParamIndex.FW_CLIMB_THROTTLE, "Climb Thr (%)", 70),
-        (ParamIndex.FW_ROLL_PITCH_FF, "Roll/Pitch FF (%)", 25),
-        (ParamIndex.FW_PITCH_THROTTLE_FF, "Pitch Thr FF (%)", 50),
-        (ParamIndex.FW_AILERON_RUDDER_MIX, "Ail/Rud Mix (%)", 10),
-        (ParamIndex.FW_ALT_SPOILER_FF, "Alt Spoiler FF (%)", 50),
-        (ParamIndex.FW_SPOILER_DECAY_PERCENT_PS, "Spoiler Decay (%/s)", 15),
-        (ParamIndex.FW_AILERON_DIFFERENTIAL, "Aileron Diff (%)", 0),
-        (ParamIndex.FW_STICK_SCALE, "Stick Scale(%)", 30),
-        (ParamIndex.FW_ROLL_CONTROL_PITCH_LIMIT, "Roll/Pitch Limit (Deg)", 60),
+        (ParamIndex.FW_CLIMB_THROTTLE, "Climb Thr (%)", 60),
+        (ParamIndex.FW_ROLL_PITCH_FF, "Roll/Pitch FF (%)", 0),
+        (ParamIndex.FW_PITCH_THROTTLE_FF, "Pitch Thr FF (%)", 0),
+        (ParamIndex.FW_AILERON_RUDDER_MIX, "Ail/Rud Mix (%)", 0),
+        (ParamIndex.FW_ALT_SPOILER_FF, "Alt Spoiler FF (%)", 0),
+        (ParamIndex.RUDDER_MOTOR_FF, "Rudder/Motor FF (%)", 0),
+        (ParamIndex.FW_SPOILER_DECAY_PERCENT_PS, "Spoiler Decay (%/s)", 10),
+        (ParamIndex.FW_AILERON_DIFFERENTIAL, "Aileron Diff (%)", 40),
+        (ParamIndex.FW_ROLL_AUTHORITY, "Roll Auth (%)", 25),
+        (ParamIndex.FW_PITCH_AUTHORITY, "Pitch Auth (%)", 25),
+        (ParamIndex.FW_YAW_AUTHORITY, "Yaw Auth (%)", 25),
         (ParamIndex.FW_BOARD_PITCH_ANGLE, "Board Pitch (Deg)", 0),
     ]
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, configuration_required=False):
         super().__init__(parent)
         self.params = {}
         self.dirty_params = set()
+        self._fc_cfg_pend = False
+        # Fresh/out-of-the-box FC (empty airframe name on tag 63): show only
+        # the toolbar + a banner until a generic .af is loaded (Greg 2026-09-25).
+        self._configuration_required = bool(configuration_required)
         self.rc_channels = [0] * 16
         self._param_grid = None
         self._config_group = None
@@ -224,27 +782,69 @@ class ParameterWindow(QMainWindow):
         self.motor_bars = []
         self.motor_pct_labels = []
         self.motor_name_labels = []
+        self._last_motor_fd = None
+        self._motor_nan_warned = False
         self.parent_window = parent
         self.voltage_trim = 1.0
         self._params_received = False
         self._read_request_id = None
-        self._write_request_id = None
+        self._committed_values = {}  # last FC-loaded values for protected param revert
+        self._warned_protected = set()  # track which protected params have been warned this session
+        self._baseline_snapshot = {}  # param values at last load — for dirty detection
+        self._baseline_source_path = None  # .af path that was loaded (for default save path)
         self._read_timeout_timer = None
         self._write_timeout_timer = None
         self._verify_mode = False
         self._written_params = {}
         self._written_float = {}
+        # Last full tag-71 readback (idx -> raw float). Base for the tag-77 block
+        # image so params with no widget are never zeroed by a block write.
+        self._fc_readback_float: Dict[int, float] = {}
         self._write_in_progress = False
+        self._flash_write_pending = False  # commit interlock: True from commit start until verify resolves
         self._verification_timer = None
+        # Commit button state: 'idle' (grey, flash matches the UI, nothing to
+        # send), 'pending' (red, local edits not yet in flash), 'committing'
+        # (amber, tag-77 sent, waiting for the FC's reboot + readback), or
+        # 'confirmed' (green, the post-reboot tag-71 readback matched).
+        self._commit_state = 'idle'
+        # A commit that ARRIVED while another was in flight is queued here and
+        # drained by the in-flight commit's resolution — never silently dropped.
+        self._apply_retry_pending = False
+        # Watchdog for the post-reboot reconnect that resolves the deferred
+        # verification. If the FC never streams a flight packet after a commit
+        # (e.g. stuck at a boot gate), the interlock would stick forever and
+        # abort every later Apply & Reboot; this breaks the stall loudly.
+        self._reconnect_watchdog_timer = None
         self._expecting_param_packet = False
         self._write_timestamp = 0
         self.MAX_PARAMS = 128
         self._config_values = {}
+        self.servo_sense_checks = []
         self._current_airframe_path = None
-        self._legacy_mode = False
-        self.setWindowTitle("UAVX Parameters")
-        self.setMinimumSize(1200, 900)
-        
+        self._airframe_limits: Dict[int, Tuple[float, float]] = {}  # .af [LIMITS] raw ranges
+        self._legacy_mode = False  # default OFF: unified raw float display (see legacy_check init)
+        self._flash_airframe_name = None  # single source of truth: name from FC config flash
+        self._generic_dir = os.path.join(os.path.dirname(__file__), '..', 'airframes', 'generic')
+        self._user_dir = workspace.airframes_dir()
+        self._proposed_dir = os.path.join(os.path.dirname(__file__), '..', 'airframes', 'proposed')
+        self._warned_protected = set()  # track protected params that have been warned this session
+        self._clamped_widgets = set()   # widgets currently showing the FC-clamp red highlight
+
+        # Auto robustness safety check (debounced; run after Compute or tuning edits)
+        self._suppress_sim_auto = True  # True during init/bulk loads; armed after __init__
+        self._sim_busy = False
+        self._sim_debounce = QTimer(self)
+        self._sim_debounce.setSingleShot(True)
+        self._sim_debounce.setInterval(800)
+        self._sim_debounce.timeout.connect(self._run_auto_sim)
+        self.sim_finished.connect(self._on_sim_finished)
+        # Cascade-integrity caveats (20–30% I band, P-path vs rate cap)
+        self._cascade_warnings = []
+        self._last_caveat_msg = ""
+        self._warn_cascade_dialog = True
+
+
         self.setup_ui()
         self._restore_airframe_selection()
         self.setup_connections()
@@ -259,9 +859,9 @@ class ParameterWindow(QMainWindow):
         self.update_rc_display()
         self.reset_read_button()
         self.reset_write_button()
-        
-        print("🔵 Parameter window initialized (refactored with enums)")
-        
+
+        self._suppress_sim_auto = False
+
         # Auto-read params from FC after a short delay to let the UI settle
         QTimer.singleShot(100, self.read_params)
     
@@ -276,6 +876,15 @@ class ParameterWindow(QMainWindow):
     def on_data_updated(self, flight_data):
         self.update_rc_display()
         self._check_mag_var_wmm(flight_data)
+        self._update_cruise_thr_readout(flight_data)
+
+    def _update_cruise_thr_readout(self, flight_data):
+        """Show the FC-tracked cruise throttle feed-forward (read-only)."""
+        label = getattr(self, '_cruise_thr_label', None)
+        if label is None or flight_data is None:
+            return
+        thr = float(getattr(flight_data, 'cruise_throttle', 0.0) or 0.0)
+        label.setText(f"{thr:.0%}" if thr > 0.0 else "--%")
 
     def _check_mag_var_wmm(self, flight_data):
         MAG_VAR_THRESHOLD_DEG = 3.0
@@ -328,6 +937,45 @@ class ParameterWindow(QMainWindow):
             return 1.0 / PARAM_SCALES.get(idx, 1.0)
         return PARAM_DISPLAY_MULT.get(idx, 1.0)
 
+    def _param_limits(self, idx: int) -> Tuple[float, float]:
+        """Effective raw (lo, hi) for a param — .af [LIMITS] range if present,
+        else the derived class ceiling from PARAM_LIMITS."""
+        return self._airframe_limits.get(idx,
+                                         PARAM_LIMITS.get(idx, (0.0, 255.0)))
+
+    def _min_decimals(self, idx: int, dec: int) -> int:
+        """PID/gain terms (the 18 values across Roll/Pitch/Yaw/Alt/Nav) always
+        need 4 decimal places so fine rad/s values round-trip cleanly; never
+        let a coarse step-derived precision round them in the spinbox."""
+        if idx in PID_GAIN_TAGS and dec < 4:
+            return 4
+        return dec
+
+    def _resolve_combo_index(self, widget, value) -> int:
+        """Return the combo index whose itemData == value, appending a marked
+        "? Unknown (N)" item carrying the true raw value if absent.
+
+        NEVER falls back to treating the raw value as a positional index, and
+        NEVER leaves a stale selection in place. The AF_TYPE combo is sorted by
+        display NAME, not by enum value (data domain = the full enum, incl.
+        REDACTED types like eAileronAF), so value-as-index silently selected
+        the WRONG airframe — e.g. a missed eAileronAF (15) clamps to index 9 =
+        X Quadcopter and a re-save wrote eQuadXAF into the file (the FW-as-XQuad
+        / Elevon-as-Delta corruption). A miss (corrupt file / future enum this
+        GCS doesn't know) therefore APPENDS the value so it stays visible AND
+        round-trips true: itemData == the actual value, so a save can never
+        bake a stale substitution. findData after append always succeeds.
+        """
+        int_value = int(value)
+        cb_idx = widget.findData(int_value)
+        if cb_idx >= 0:
+            return cb_idx
+        widget.addItem(f"? Unknown ({int_value})", int_value)
+        cb_idx = widget.findData(int_value)
+        self._log(f"  ⚠️ Param value {int_value} not in combo data domain; "
+                  f"appended '? Unknown ({int_value})' carrying the true value")
+        return cb_idx
+
     def _on_legacy_toggled(self, checked: bool):
         self._legacy_mode = checked
         self._refresh_legacy_display()
@@ -339,10 +987,6 @@ class ParameterWindow(QMainWindow):
         recover the raw float32, then set the new range and value using
         the NEW (possibly legacy) mult.  The raw value is preserved.
         """
-        # prev_mult is the multiplier that was active before the toggle.
-        # _legacy_mode has already been updated, so:
-        #   - if legacy is now ON,  prev was the normal mult
-        #   - if legacy is now OFF, prev was the legacy mult (for LEGACY_TAGS)
         if self._legacy_mode:
             prev_mult_fn = lambda i: PARAM_DISPLAY_MULT.get(i, 1.0)
         else:
@@ -357,16 +1001,21 @@ class ParameterWindow(QMainWindow):
             except (ZeroDivisionError, ValueError):
                 continue
             new_mult = self._display_mult(idx)
-            limits = PARAM_LIMITS.get(idx, (0.0, 255.0))
+            limits = self._param_limits(idx)
             lo = limits[0] * new_mult
             hi = limits[1] * new_mult
             span = hi - lo
             step = max(0.001, span / 50.0)
             if new_mult == 100:
                 step = 1.0
-            if idx in (68, 113) and step < 1.0:
+            if idx in (68,) and step < 1.0:
                 step = 1.0
+            if idx in ONE_DECIMAL_LIMIT_TAGS:
+                step = 0.1
             dec = max(0, min(6, -int(math.floor(math.log10(step)))))
+            # PID/gain terms: keep at least 4 decimals in every display mode
+            if idx in PID_GAIN_TAGS:
+                dec = max(dec, 4)
             if new_mult not in (1.0, 100.0) and dec == 0 and step > 0.1:
                 step = 0.1
                 dec = 1
@@ -395,7 +1044,13 @@ class ParameterWindow(QMainWindow):
                 val = 0.0
             received_u8[idx] = max(0, min(255, int(val)))
             received_float[idx] = val
-        
+
+        # A full readback is the base for the next tag-77 block image. Cache it
+        # so params the GCS has no widget for keep the FC's value instead of
+        # being written as 0.0. Echo ACKs (count == 1) must not overwrite it.
+        if getattr(typed_data, 'count', 0) > 100:
+            self._fc_readback_float = dict(received_float)
+
         # Verification path — only on bulk readback (echo ACKs skip this)
         if (self._verify_mode and self._expecting_param_packet and self._written_params
                 and typed_data.count > 100):
@@ -409,19 +1064,31 @@ class ParameterWindow(QMainWindow):
             self._verify_parameters(received_u8, received_float)
             return
         
-        # Normal update
+        # Normal update — block signals: a readback/echo is NOT a user edit.
+        # Without this, every tag-71 readback (connect auto-populate) echoed
+        # the FC's values back as phantom live-writes, popped the
+        # protected-param confirm dialog for the first changed selector (e.g.
+        # P90 ASSensorType), and re-armed the Apply & Reboot offer.
         for idx in received_u8:
             if idx not in self.params:
                 continue
             widget = self.params[idx]
             try:
-                if isinstance(widget, QDoubleSpinBox):
-                    mult = self._display_mult(idx)
-                    fc_float = received_float.get(idx, float(received_u8[idx]))
-                    widget.setValue(fc_float * mult)
-                elif isinstance(widget, QComboBox):
-                    if received_u8[idx] < widget.count():
-                        widget.setCurrentIndex(received_u8[idx])
+                widget.blockSignals(True)
+                try:
+                    if isinstance(widget, QDoubleSpinBox):
+                        mult = self._display_mult(idx)
+                        fc_float = received_float.get(idx, float(received_u8[idx]))
+                        widget.setValue(fc_float * mult)
+                        if idx in self._PROTECTED_PARAMS:
+                            self._committed_values[idx] = widget.value()
+                    elif isinstance(widget, QComboBox):
+                        cb_idx = self._resolve_combo_index(widget, int(received_u8[idx]))
+                        widget.setCurrentIndex(cb_idx)
+                        if idx in self._PROTECTED_PARAMS:
+                            self._committed_values[idx] = float(int(received_u8[idx]))
+                finally:
+                    widget.blockSignals(False)
             except Exception:
                 pass
 
@@ -430,16 +1097,19 @@ class ParameterWindow(QMainWindow):
             ci = int(cfg_idx)
             if ci in received_float:
                 self._config_values[ci] = int(received_float[ci])
-        self.update_config_display()
 
         # Don't touch UI state during write — echo ACKs update widgets in-place
         if self._verify_mode or self._write_in_progress:
             return
 
+        self.update_config_display()
         self.dirty_params.clear()
         self._params_received = True
+        self.sync_setup_from_advanced()
         self.status_label.setText("✅ Parameters loaded from FC (typed)")
         self.status_label.setStyleSheet("color: #27ae60;")
+        # A plain connect/readback refreshes the UI from flash: they agree again.
+        self._set_commit_state('idle')
         self.reset_read_button()
         self._read_request_id = None
 
@@ -465,7 +1135,7 @@ class ParameterWindow(QMainWindow):
         
         received_params = {}
         for i in range(self.MAX_PARAMS):
-            if i in self.params:
+            if self.param_widget(i) is not None:
                 received_params[i] = params_list[i] if i < len(params_list) else 0
         
         should_verify = (self._verify_mode and self._expecting_param_packet) or (self._write_timestamp > 0 and time_since_write < 2.0)
@@ -489,8 +1159,8 @@ class ParameterWindow(QMainWindow):
         
         update_count = 0
         for i in range(self.MAX_PARAMS):
-            if i in self.params:
-                widget = self.params[i]
+            widget = self.param_widget(i)
+            if widget is not None:
                 try:
                     value = received_params.get(i, 0)
                     if isinstance(widget, QDoubleSpinBox):
@@ -498,9 +1168,9 @@ class ParameterWindow(QMainWindow):
                         widget.setValue(float(value) * mult)
                         update_count += 1
                     elif isinstance(widget, QComboBox):
-                        if value < widget.count():
-                            widget.setCurrentIndex(value)
-                            update_count += 1
+                        cb_idx = self._resolve_combo_index(widget, int(value))
+                        widget.setCurrentIndex(cb_idx)
+                        update_count += 1
                 except Exception as e:
                     self._log(f"  ⚠️ Failed to update param {i}: {e}")
         
@@ -512,10 +1182,13 @@ class ParameterWindow(QMainWindow):
         
         self._log(f"  ✅ Updated {update_count} parameters")
         self.update_config_display()
+        self.sync_setup_from_advanced()
         self.dirty_params.clear()
         self._params_received = True
         self.status_label.setText(f"✅ Parameters loaded from FC (Set={param_set})")
         self.status_label.setStyleSheet("color: #27ae60;")
+        # A plain connect/readback refreshes the UI from flash: they agree again.
+        self._set_commit_state('idle')
         self.reset_read_button()
         
         if self._read_timeout_timer:
@@ -530,11 +1203,12 @@ class ParameterWindow(QMainWindow):
         Falls back to uint8 comparison for U8 params and when float data is missing.
         """
         self._log(f"  🔍 Verifying {len(self._written_params)} params...")
-        
+
         if len(self._written_params) == 0:
             self._log("  ⚠️ WARNING: No written params to verify!")
             self._verify_mode = False
             self._write_in_progress = False
+            self._flash_write_pending = False
             self._expecting_param_packet = False
             self._write_timestamp = 0
             if self._write_timeout_timer:
@@ -548,13 +1222,15 @@ class ParameterWindow(QMainWindow):
                 "Please try writing again."
             )
             self.reset_write_button()
+            self._set_commit_state('pending')
             return
         
         mismatches = []
         derived_warnings = []
         clamped_warnings = []
         mismatch_indices = []
-        
+        clamped_indices = set()
+
         # Derived params that FC recalculates via ApplyParameters
         derived_params = {
             ParamIndex.MAX_ROLL_RATE: "MaxRollRate",
@@ -564,29 +1240,16 @@ class ParameterWindow(QMainWindow):
             ParamIndex.ACC_CONF_SD: "AccConfSD",
             ParamIndex.FW_ROLL_PITCH_FF: "FWRollPitchFF",
         }
-        
-        # Params with clamping ranges - use raw ints to avoid enum issues
-        clamped_indices = [70, 68, 69, 53, 31, 46, 80, 111, 112, 115, 116]
-        clamped_ranges = {
-            70: (10, 50),   # FWAileronDifferential
-            68: (10, 180),  # FWMaxClimbAngle
-            69: (10, 60),   # NavMaxAngle
-            53: (1, 127),   # BatteryCapacity
-            31: (30, 50),   # MadgwickKpMag
-            46: (1, 10),    # MaxDescentRateDmpS
-            80: (0, 1),  # YawSymmetryFactor
-            111: (2, 200),  # KFAccUVar
-            112: (2, 200),  # FWStickScale
-             115: (20, 20000), # NavFenceRadiusM
-             116: (0, 250),  # DiveRecoverAlt
-        }
-        
+
+        # FC hard-clamps are detected generically: written value lands outside
+        # PARAM_LIMITS (raw) and the received value equals the lo/hi ceiling.
+        # No per-param hardcoded range table needed anymore.
         for idx, written_value in self._written_params.items():
             received_value = received_params.get(idx)
             if received_value is None:
-                mismatches.append(f"P{idx+1}: Written={written_value}, Not received")
+                mismatches.append(f"{ParamIndex(idx).name}: Written={written_value}, Not received")
                 mismatch_indices.append(idx)
-                self._log(f"    ❌ P{idx+1}: Not received")
+                self._log(f"    ❌ {ParamIndex(idx).name}: Not received")
                 continue
 
             # For FLOAT params with float data, compare in float32 space
@@ -598,74 +1261,124 @@ class ParameterWindow(QMainWindow):
                 wf = self._written_float[idx]
                 rf = received_float[idx]
                 if abs(wf - rf) < 1e-6:
-                    self._log(f"    ✅ P{idx+1}: float {wf} == {rf}")
+                    self._log(f"    ✅ {ParamIndex(idx).name}: float {wf} == {rf}")
                     continue
                 if idx in derived_params:
                     derived_warnings.append(
-                        f"P{idx+1} ({derived_params[idx]}): Written={wf} → "
+                        f"{ParamIndex(idx).name}: Written={wf} → "
                         f"Recalculated to {rf} (FC derived parameter)"
                     )
-                    self._log(f"    ℹ️ P{idx+1}: {wf} → {rf} (derived)")
+                    self._log(f"    ℹ️ {ParamIndex(idx).name}: {wf} → {rf} (derived)")
                     continue
-                mismatches.append(f"P{idx+1}: Written={wf}, Received={rf}")
+                lo, hi = PARAM_LIMITS.get(idx, (0.0, 255.0))
+                if (wf < lo and abs(rf - lo) < 1e-6) or (wf > hi and abs(rf - hi) < 1e-6):
+                    clamped_warnings.append(
+                        f"{ParamIndex(idx).name}: Written={wf} → "
+                        f"Clamped to {rf} (range {lo:.6g}-{hi:.6g})")
+                    clamped_indices.add(idx)
+                    self._log(f"    ⚠️ {ParamIndex(idx).name}: {wf} → {rf} (clamped)")
+                    continue
+                mismatches.append(f"{ParamIndex(idx).name}: Written={wf}, Received={rf}")
                 mismatch_indices.append(idx)
-                self._log(f"    ❌ P{idx+1}: Written={wf}, Received={rf}")
+                self._log(f"    ❌ {ParamIndex(idx).name}: Written={wf}, Received={rf}")
                 continue
 
             # Fall back to uint8 comparison (U8 params, or float data unavailable)
             if written_value != received_value:
                 if idx in derived_params:
                     derived_warnings.append(
-                        f"P{idx+1} ({derived_params[idx]}): Written={written_value} → "
+                        f"{ParamIndex(idx).name}: Written={written_value} → "
                         f"Recalculated to {received_value} (FC derived parameter)"
                     )
-                    self._log(f"    ℹ️ P{idx+1}: {written_value} → {received_value} (derived)")
+                    self._log(f"    ℹ️ {ParamIndex(idx).name}: {written_value} → {received_value} (derived)")
                     continue
 
-                if idx in clamped_indices:
-                    min_val, max_val = clamped_ranges.get(idx, (0, 255))
-                    if written_value < min_val and received_value == min_val:
-                        clamped_warnings.append(f"P{idx+1}: Written={written_value} → Clamped to {received_value} (min={min_val})")
-                        self._log(f"    ⚠️ P{idx+1}: {written_value} → {received_value} (clamped)")
-                        continue
-                    elif written_value > max_val and received_value == max_val:
-                        clamped_warnings.append(f"P{idx+1}: Written={written_value} → Clamped to {received_value} (max={max_val})")
-                        self._log(f"    ⚠️ P{idx+1}: {written_value} → {received_value} (clamped)")
-                        continue
+                lo, hi = PARAM_LIMITS.get(idx, (0.0, 255.0))
+                if (written_value < lo and received_value == int(lo)) or \
+                        (written_value > hi and received_value == int(hi)):
+                    clamped_warnings.append(
+                        f"{ParamIndex(idx).name}: Written={written_value} → "
+                        f"Clamped to {received_value} (range {lo:.6g}-{hi:.6g})")
+                    clamped_indices.add(idx)
+                    self._log(f"    ⚠️ {ParamIndex(idx).name}: {written_value} → {received_value} (clamped)")
+                    continue
 
-                mismatches.append(f"P{idx+1}: Written={written_value}, Received={received_value}")
+                mismatches.append(f"{ParamIndex(idx).name}: Written={written_value}, Received={received_value}")
                 mismatch_indices.append(idx)
-                self._log(f"    ❌ P{idx+1}: Written={written_value}, Received={received_value}")
+                self._log(f"    ❌ {ParamIndex(idx).name}: Written={written_value}, Received={received_value}")
             else:
-                self._log(f"    ✅ P{idx+1}: {written_value} == {received_value}")
+                self._log(f"    ✅ {ParamIndex(idx).name}: {written_value} == {received_value}")
         
         self._verify_mode = False
         self._write_in_progress = False
+        self._flash_write_pending = False
+        if self._reconnect_watchdog_timer is not None:
+            self._reconnect_watchdog_timer.stop()
+            self._reconnect_watchdog_timer = None
+        self._drain_queued_apply()
+        self.reset_read_button()
         
         # Sync UI widgets with FC's actual values (in case of mismatches, clamps, or derived)
-        for i, value in received_params.items():
-            if i not in self.params:
+        self._suppress_sim_auto = True
+        try:
+            for i, value in received_params.items():
+                if i not in self.params:
+                    continue
+                widget = self.params[i]
+                try:
+                    widget.blockSignals(True)
+                    try:
+                        if isinstance(widget, QDoubleSpinBox):
+                            mult = self._display_mult(i)
+                            if received_float is not None and i in received_float:
+                                widget.setValue(received_float[i] * mult)
+                            else:
+                                widget.setValue(float(value) * mult)
+                            if i in self._PROTECTED_PARAMS:
+                                display_val = widget.value()
+                                self._committed_values[i] = display_val
+                        elif isinstance(widget, QComboBox):
+                            cb_idx = self._resolve_combo_index(widget, int(value))
+                            widget.setCurrentIndex(cb_idx)
+                            if i in self._PROTECTED_PARAMS:
+                                self._committed_values[i] = float(int(value))
+                    finally:
+                        widget.blockSignals(False)
+                except Exception:
+                    pass
+                # Update _config_values cache for config bit params
+                if i == int(ParamIndex.CONFIG1_BITS) or i == int(ParamIndex.CONFIG2_BITS):
+                    old = self._config_values.get(i, -1)
+                    if old != value:
+                        self._log(f"  🔧 Config{i}: _config_values {old} → {value} (synced from FC)")
+                    self._config_values[i] = int(value)
+        finally:
+            self._suppress_sim_auto = False
+        if hasattr(self, '_update_fw_style'):
+            self._update_fw_style()
+        if hasattr(self, 'sync_setup_from_advanced'):
+            self.sync_setup_from_advanced()
+
+        # Red highlight = FC hard-clamped this param's write to the ceiling.
+        # Persistent until the user edits the widget (param_changed restyles)
+        # or a fresh load clears it (see _set_widgets_from_raw).
+        for idx in clamped_indices:
+            if idx not in self.params:
                 continue
-            widget = self.params[i]
-            try:
-                if isinstance(widget, QDoubleSpinBox):
-                    mult = self._display_mult(i)
-                    if received_float is not None and i in received_float:
-                        widget.setValue(received_float[i] * mult)
-                    else:
-                        widget.setValue(float(value) * mult)
-                elif isinstance(widget, QComboBox):
-                    if value < widget.count():
-                        widget.setCurrentIndex(max(0, min(widget.count()-1, int(value))))
-            except Exception:
-                pass
-            # Update _config_values cache for config bit params
-            if i == int(ParamIndex.CONFIG1_BITS) or i == int(ParamIndex.CONFIG2_BITS):
-                old = self._config_values.get(i, -1)
-                if old != value:
-                    self._log(f"  🔧 Config{i}: _config_values {old} → {value} (synced from FC)")
-                self._config_values[i] = int(value)
-        
+            widget = self.params[idx]
+            if isinstance(widget, QDoubleSpinBox):
+                widget.setStyleSheet("""
+                    QDoubleSpinBox {
+                        padding: 1px 2px;
+                        background-color: #f2a0a0;
+                        border: 1px solid #e74c3c;
+                    }
+                    QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {
+                        width: 12px;
+                    }
+                """)
+        self._clamped_widgets = set(clamped_indices)
+
         self.update_config_display()
         self.dirty_params.clear()
         
@@ -705,23 +1418,8 @@ class ParameterWindow(QMainWindow):
             msg.exec_()
             self.status_label.setText(f"❌ Verification failed: {len(mismatches)} mismatches")
             self.status_label.setStyleSheet("color: #e74c3c;")
-            
-            self.WriteParamsButton.setStyleSheet("""
-                QPushButton {
-                    background-color: #e74c3c;
-                    color: white;
-                    font-weight: bold;
-                    border: 2px solid #c0392b;
-                    border-radius: 4px;
-                    padding: 4px 8px;
-                }
-                QPushButton:hover {
-                    background-color: #c0392b;
-                }
-            """)
-            self.WriteParamsButton.setText("❌ Failed")
-            self.WriteParamsButton.setEnabled(True)
-            QTimer.singleShot(3000, self.reset_write_button)
+            self._set_commit_state('pending')
+
         elif derived_warnings or clamped_warnings:
             warning_text = ""
             if derived_warnings and clamped_warnings:
@@ -754,23 +1452,8 @@ class ParameterWindow(QMainWindow):
             )
             self.status_label.setText(f"⚠️ Written OK - {len(derived_warnings)} derived, {len(clamped_warnings)} clamped")
             self.status_label.setStyleSheet("color: #f39c12;")
-            
-            self.WriteParamsButton.setStyleSheet("""
-                QPushButton {
-                    background-color: #f39c12;
-                    color: white;
-                    font-weight: bold;
-                    border: 2px solid #e67e22;
-                    border-radius: 4px;
-                    padding: 4px 8px;
-                }
-                QPushButton:hover {
-                    background-color: #e67e22;
-                }
-            """)
-            self.WriteParamsButton.setText("⚠️ Adjusted")
-            self.WriteParamsButton.setEnabled(True)
-            QTimer.singleShot(3000, self.reset_write_button)
+            self._set_commit_state('confirmed')
+
         else:
             QMessageBox.information(
                 self,
@@ -779,82 +1462,175 @@ class ParameterWindow(QMainWindow):
             )
             self.status_label.setText(f"✅ All {len(self._written_params)} parameters verified OK!")
             self.status_label.setStyleSheet("color: #27ae60;")
-            
-            self.WriteParamsButton.setStyleSheet("""
-                QPushButton {
-                    background-color: #27ae60;
-                    color: white;
-                    font-weight: bold;
-                    border: 2px solid #229954;
-                    border-radius: 4px;
-                    padding: 4px 8px;
-                }
-                QPushButton:hover {
-                    background-color: #229954;
-                }
-            """)
-            self.WriteParamsButton.setText("✅ Success")
-            self.WriteParamsButton.setEnabled(True)
-            QTimer.singleShot(2000, self.reset_write_button)
-    
+            self._set_commit_state('confirmed')
+
     def reset_read_button(self):
-        self.ReadParamsButton.setStyleSheet("""
-            QPushButton {
-                background-color: #27ae60;
-                color: white;
-                font-weight: bold;
-                border: 2px solid #229954;
-                border-radius: 4px;
-                padding: 4px 8px;
-            }
-            QPushButton:hover {
-                background-color: #229954;
-            }
-        """)
-        self.ReadParamsButton.setText("Read")
-        self.ReadParamsButton.setEnabled(True)
+        # Read button was removed (connect auto-populates the page via tag-71);
+        # kept as a no-op so the state-reset call sites in the read/verify flow
+        # remain unchanged.
+        pass
     
+    def on_param_commit_ack(self, ok):
+        """Handle the tag-72 flash-commit ACK from the FC.
+
+        ok=True  — config confirmed written to flash; the FC is about to reboot,
+                   so the widget returns to the waiting state; the deferred
+                   post-reboot tag-71 verification then confirms the flash load.
+        ok=False — commit was NOT persisted (write/erase failed, or FC is in
+                   flight). The FC does NOT reboot. Un-arm the deferred verify,
+                   reset the button and show the failure loudly.
+        """
+        if ok:
+            self._log("  ✅ Commit ACK — config confirmed in flash; waiting for FC reboot...")
+            self.status_label.setText(
+                "✅ Saved to flash — waiting for the FC to reboot and confirm…")
+            self.status_label.setStyleSheet("color: #f39c12;")
+            return
+
+        self._log("  ❌ Commit ACK NACK — params were NOT saved to flash!")
+        self._flash_write_pending = False
+        if self._reconnect_watchdog_timer is not None:
+            self._reconnect_watchdog_timer.stop()
+            self._reconnect_watchdog_timer = None
+        self.reset_write_button()
+        if self.parent_window:
+            self.parent_window._pending_param_verification = False
+        # Not saved: the button stays RED so the user can retry.
+        self._set_commit_state('pending')
+        self.status_label.setText("❌ Commit NACK — parameters NOT saved to flash")
+        self.status_label.setStyleSheet("color: #e74c3c;")
+        # A commit queued while this one was in flight can now run — the
+        # interlock just cleared and the FC did NOT reboot.
+        self._drain_queued_apply()
+
     def reset_write_button(self):
         self._write_in_progress = False
-        self.WriteParamsButton.setStyleSheet("""
-            QPushButton {
-                background-color: #27ae60;
-                color: white;
-                font-weight: bold;
-                border: 2px solid #229954;
-                border-radius: 4px;
-                padding: 4px 8px;
-            }
-            QPushButton:hover {
-                background-color: #229954;
-            }
-        """)
-        self.WriteParamsButton.setText("Write")
-        self.WriteParamsButton.setEnabled(True)
-    
+
+    def _set_commit_state(self, state: str):
+        """Drive the explicit Commit button: grey/idle, red/pending,
+        amber/committing, green/confirmed.
+
+        The colour IS the flash-state cue (this button replaced the old colour
+        patch). Colours are set explicitly (not via the disabled palette) so
+        each state stays legible. Pending is the only enabled state - clicking
+        it commits; the others are status readouts.
+        """
+        self._commit_state = state
+        if not hasattr(self, 'commit_btn'):
+            return
+        if state == 'pending':
+            self.commit_btn.setStyleSheet(
+                "padding: 4px 12px; background-color: #e74c3c; color: #fff; "
+                "font-weight: bold; border: 1px solid #c0392b; border-radius: 3px;")
+            self.commit_btn.setText("● Commit to FC (unsaved)")
+            self.commit_btn.setEnabled(True)
+        elif state == 'committing':
+            self.commit_btn.setStyleSheet(
+                "padding: 4px 12px; background-color: #f39c12; color: #fff; "
+                "font-weight: bold; border: 1px solid #d68910; border-radius: 3px;")
+            self.commit_btn.setText("⏳ Committing…")
+            self.commit_btn.setEnabled(False)
+        elif state == 'confirmed':
+            self.commit_btn.setStyleSheet(
+                "padding: 4px 12px; background-color: #27ae60; color: #fff; "
+                "font-weight: bold; border: 1px solid #1e8449; border-radius: 3px;")
+            self.commit_btn.setText("✅ In Flash")
+            self.commit_btn.setEnabled(False)
+        else:
+            self.commit_btn.setStyleSheet(
+                "padding: 4px 12px; background-color: #bdc3c7; color: #2c3e50; "
+                "border: 1px solid #95a5a6; border-radius: 3px;")
+            self.commit_btn.setText("Commit to FC")
+            self.commit_btn.setEnabled(False)
+
+    def _mark_dirty(self):
+        """A local edit (or an airframe load) leaves flash behind: go red.
+
+        The only transition that leaves 'pending' is a successful commit; a
+        re-edit while already pending is a no-op here.
+        """
+        if self._commit_state != 'pending':
+            self._set_commit_state('pending')
+
+    def on_fc_config_uncommitted(self, uncommitted):
+        """Reflect the FC's own ConfigChanged cue (flags bit 34, cfg_pend).
+
+        A calibration the FC captured (acc/mag/gyro) sets ConfigChanged on the
+        FC without touching any GCS widget, so local dirty tracking alone never
+        prompts a commit. cfg_pend is the FC's authoritative RAM-vs-flash cue;
+        when it goes active the button must go red even with no local edit. A
+        commit already in flight owns the state machine and is left alone.
+        """
+        self._fc_cfg_pend = bool(uncommitted)
+        if self._commit_state == 'committing':
+            return
+        if uncommitted:
+            if self._commit_state != 'pending':
+                self._set_commit_state('pending')
+        elif self._commit_state == 'pending' and not self.dirty_params:
+            self._set_commit_state('idle')
+
     def _read_timeout(self):
         self._log("⏱️ Read timeout")
-        self.status_label.setText("⚠️ Read timeout - no response from FC")
+        self.status_label.setText("⚠️ Read timeout - will retry when FC data arrives")
         self.status_label.setStyleSheet("color: #e74c3c;")
         self.reset_read_button()
         self._read_request_id = None
         self._read_timeout_timer = None
+        self._read_retry_pending = True
+
+    def retry_read_if_pending(self):
+        if getattr(self, '_read_retry_pending', False):
+            self._log("🔄 FC data received - retrying param read")
+            self._read_retry_pending = False
+            self.read_params()
     
     def _write_timeout(self):
         self._log("⏱️ Write timeout - resetting")
         self._write_in_progress = False
+        self._flash_write_pending = False
         if self._verify_mode:
             self._verify_mode = False
         self._written_params = {}
         self._written_float = {}
         self._expecting_param_packet = False
         self._write_timestamp = 0
+        # Interlock just released — run any commit that was queued behind it.
+        self._drain_queued_apply()
 
         self.status_label.setText("⚠️ Write timeout - no response from FC")
         self.status_label.setStyleSheet("color: #e74c3c;")
         self.reset_write_button()
-        self._write_request_id = None
         self._write_timeout_timer = None
+    
+    _CATEGORY_LABELS = {
+        'MR': 'MR', 'FW': 'FW', 'VTOL': 'VTOL', 'LAND': 'Land', 'NONE': 'Sensor',
+    }
+
+    def _category_for_af_file(self, path):
+        """Read AF_TYPE from an .af file and return its class label ('MR'/'FW'/...)"""
+        try:
+            with open(path) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line.startswith('AF_TYPE') or '=' not in line:
+                        continue
+                    val = line.split('=', 1)[1].strip()
+                    try:
+                        member = af_module._resolve_enum_member(AirframeType, val)
+                        if member is not None:
+                            af = member
+                        else:
+                            af = AirframeType(int(val))
+                    except (KeyError, ValueError):
+                        return 'MR'
+                    cat = self._category_for_af(af.value)
+                    return self._CATEGORY_LABELS.get(cat, 'MR')
+        except OSError:
+            pass
+        return 'MR'
+
+
     
     def setup_ui(self):
         central = QWidget()
@@ -862,106 +1638,134 @@ class ParameterWindow(QMainWindow):
         main_layout = QVBoxLayout(central)
         main_layout.setSpacing(4)
         main_layout.setContentsMargins(4, 4, 4, 4)
+
+        # Static banner shown only while configuration_required (no airframe
+        # loaded on the FC). Lives in main_layout so it always exists.
+        self.config_banner = QLabel(
+            "⚠️ No airframe configured — Load Airframe… below,"
+            " then the parameters page opens.")
+        self.config_banner.setStyleSheet(
+            "color: #8a5a00; background: #fff3d6; border: 1px solid #e0b34d;"
+            " padding: 6px; font-weight: bold;")
+        self.config_banner.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.config_banner.setWordWrap(True)
+        self.config_banner.setVisible(self._configuration_required)
+        main_layout.addWidget(self.config_banner)
         
         toolbar = QHBoxLayout()
         toolbar.setSpacing(4)
-        
-        self.ReadParamsButton = QPushButton("Read")
-        self.ReadParamsButton.setStyleSheet("""
-            QPushButton {
-                font-weight: bold; 
-                padding: 4px 12px;
-                background-color: #27ae60;
-                color: white;
-                border: 2px solid #229954;
-                border-radius: 4px;
-            }
-            QPushButton:hover {
-                background-color: #229954;
-            }
-            QPushButton:disabled {
-                background-color: #95a5a6;
-                color: #666;
-            }
-        """)
-        self.ReadParamsButton.setProperty('original_text', 'Read')
-        toolbar.addWidget(self.ReadParamsButton)
-        
-        self.WriteParamsButton = QPushButton("Write")
-        self.WriteParamsButton.setStyleSheet("""
-            QPushButton {
-                font-weight: bold; 
-                padding: 4px 12px;
-                background-color: #27ae60;
-                color: white;
-                border: 2px solid #229954;
-                border-radius: 4px;
-            }
-            QPushButton:hover {
-                background-color: #229954;
-            }
-            QPushButton:disabled {
-                background-color: #95a5a6;
-                color: #666;
-            }
-        """)
-        self.WriteParamsButton.setProperty('original_text', 'Write')
-        toolbar.addWidget(self.WriteParamsButton)
-        
-        self.load_btn = QPushButton("Load Params")
-        self.load_btn.setStyleSheet("padding: 4px 12px;")
-        toolbar.addWidget(self.load_btn)
-        
+
         self.save_btn = QPushButton("Save Params")
         self.save_btn.setStyleSheet("padding: 4px 12px;")
         toolbar.addWidget(self.save_btn)
-        
-        self.airframe_combo = QComboBox()
-        self.airframe_combo.setMinimumWidth(160)
-        self.airframe_combo.setToolTip("Select airframe to load defaults")
-        self.airframe_combo.addItem("— Defaults —", "__DEFAULTS__")
-        airframe_list = af_module.list_airframes()
-        for name, path in airframe_list:
-            self.airframe_combo.addItem(name, path)
-        toolbar.addWidget(self.airframe_combo)
-        
-        self.legacy_check = QCheckBox("Legacy")
-        self.legacy_check.setToolTip("Display legacy-tagged params as raw/scale (classic FC units)")
-        self.legacy_check.toggled.connect(self._on_legacy_toggled)
-        toolbar.addWidget(self.legacy_check)
-        
+
+        self.load_btn = QPushButton("Load Airframe…")
+        self.load_btn.setStyleSheet("padding: 4px 12px;")
+        self.load_btn.setToolTip("Open the airframe library and load defaults + tuning limits")
+        toolbar.addWidget(self.load_btn)
+
+        # The airframe name corresponding to the CURRENT flash parameters,
+        # supplied by the FC config block (tag-63). Survives reboots because it
+        # is re-pulled with every commit verification and connect.
+        self.airframe_name_label = QLabel("")
+        self.airframe_name_label.setStyleSheet("color: #000; font-weight: normal;")
+        self.airframe_name_label.setToolTip("Airframe name persisted in the FC config flash")
+        self.airframe_name_label.hide()
+        toolbar.addWidget(self.airframe_name_label)
+
         toolbar.addStretch()
-        
-        self.status_label = QLabel("Ready - Click Read to get parameters from FC")
+
+        self.status_label = QLabel("Ready")
         self.status_label.setStyleSheet("color: #666;")
         toolbar.addWidget(self.status_label)
-        
+
+        # One explicit Commit at the right-hand end of the bar. Edits are LOCAL
+        # to the GCS until this is pressed: no parameter is written to the FC on
+        # change. The button's text carries the save state - the old coloured
+        # flash-state patch is gone.
+        self.commit_btn = QPushButton("Commit to FC")
+        self.commit_btn.setToolTip(
+            "Send every parameter to the FC in one block, write it to flash, "
+            "and restart the FC.")
+        toolbar.addWidget(self.commit_btn)
+
         main_layout.addLayout(toolbar)
-        
+
+        # Whole parameter body (RC/motor, pages, info) lives in ONE container so
+        # the configuration-required gate can show toolbar-only + banner by
+        # hiding it wholesale (Greg 2026-09-25).
+        self.config_body = QWidget()
+        self.config_body_layout = QVBoxLayout(self.config_body)
+        self.config_body_layout.setSpacing(4)
+        self.config_body_layout.setContentsMargins(0, 0, 0, 0)
+
         # RC + Motors always visible (not scrollable)
         rc_motor_row = QHBoxLayout()
         rc_motor_row.setSpacing(0)
         rc_motor_row.setContentsMargins(0, 0, 0, 0)
         rc_combined = self._create_rc_combined_group()
+        rc_combined.setFixedHeight(160)
         rc_motor_row.addWidget(rc_combined, 3)
         motor_group = self._create_motor_group()
+        motor_group.setFixedHeight(160)
         rc_motor_row.addWidget(motor_group, 2)
-        main_layout.addLayout(rc_motor_row)
+        self.config_body_layout.addLayout(rc_motor_row)
         
-        # Parameter groups directly in main layout (no scroll bar = perfect width alignment)
+        # Params page — Setup+Physics, Advanced toggle, and grid all inside here
         params_container = QWidget()
         self.param_layout = QVBoxLayout(params_container)
         self.param_layout.setSpacing(4)
         self.param_layout.setContentsMargins(2, 2, 2, 2)
         
+        # Create the 2×4 grid FIRST (hidden until Advanced checked)
+        # Must come before Setup group so self.params widgets exist
         self.create_parameter_groups()
         
+        # Setup + Physics side by side
+        setup_physics_row = QHBoxLayout()
+        setup_physics_row.setSpacing(4)
+        setup_group = self._create_setup_group()
+        setup_physics_row.addWidget(setup_group, 1)
+        physics_group = self._create_physics_group()
+        setup_physics_row.addWidget(physics_group, 1)
+        self.param_layout.addLayout(setup_physics_row)
+        
         # AF_TYPE combo controls FW group styling
-        af_combo = self.params.get(int(ParamIndex.AF_TYPE))
+        af_combo = self._setup_widgets.get(int(ParamIndex.AF_TYPE))
         if af_combo and isinstance(af_combo, QComboBox):
             af_combo.currentIndexChanged.connect(self._update_fw_style)
         
-        main_layout.addWidget(params_container)
+        # Advanced toggle + Legacy, side by side
+        advanced_row = QHBoxLayout()
+        advanced_row.setSpacing(4)
+        self._advanced_checkbox = QCheckBox("Advanced Parameters")
+        self._advanced_checkbox.setToolTip("Show all parameter groups (PID, General, Config, etc.)")
+        self._advanced_checkbox.setStyleSheet("font-weight: bold; padding: 2px;")
+        self._advanced_checkbox.toggled.connect(self._on_advanced_toggled)
+        advanced_row.addWidget(self._advanced_checkbox)
+
+        self.legacy_check = QCheckBox("Legacy")
+        self.legacy_check.setToolTip("Display legacy-tagged params as raw/scale (classic FC units)")
+        self.legacy_check.toggled.connect(self._on_legacy_toggled)
+        # Initial state mirrors __init__'s _legacy_mode (False = unified raw
+        # display). Widgets are already built in unified units via _display_mult,
+        # so set the visual state WITHOUT firing a redundant refresh (would
+        # double-convert when the user later toggles legacy on).
+        self.legacy_check.blockSignals(True)
+        self.legacy_check.setChecked(self._legacy_mode)
+        self.legacy_check.blockSignals(False)
+        advanced_row.addWidget(self.legacy_check)
+        advanced_row.addStretch(1)
+        self.param_layout.addLayout(advanced_row)
+        
+        # Advanced grid goes below the checkbox (Aircraft Config is above it)
+        if hasattr(self, '_grid_container'):
+            self.param_layout.addWidget(self._grid_container)
+        
+        self.config_body_layout.addWidget(params_container)
+        
+        # Prevent RC/Motors from stretching vertically
+        self.config_body_layout.addStretch(0)
         
         info_box = QGroupBox()
         info_box.setTitle("Info")
@@ -973,7 +1777,35 @@ class ParameterWindow(QMainWindow):
         self.info_text.setStyleSheet("padding: 3px; background-color: #f8f8f8; color: #555;")
         info_layout.addWidget(self.info_text)
         info_box.setLayout(info_layout)
-        main_layout.addWidget(info_box)
+        self.config_body_layout.addWidget(info_box)
+
+        main_layout.addWidget(self.config_body)
+        if self._configuration_required:
+            # Gate state at init = just the Load Airframe… selector + banner
+            # (Greg 2026-09-25); the param body and the rest of the toolbar are
+            # revealed once an airframe loads.
+            self.config_body.setVisible(False)
+            self.config_banner.setVisible(True)
+            self.save_btn.setVisible(False)
+            self.commit_btn.setVisible(False)
+            self.status_label.setVisible(False)
+        else:
+            self.config_body.setVisible(True)
+            self.config_banner.setVisible(False)
+            self.save_btn.setVisible(True)
+            self.commit_btn.setVisible(True)
+            self.status_label.setVisible(True)
+
+        self._set_commit_state('idle')
+    
+    def _on_advanced_toggled(self, checked):
+        """Show/hide the advanced parameter grid. Window expands when Advanced is shown."""
+        if hasattr(self, '_grid_container'):
+            self._grid_container.setVisible(checked)
+        if checked:
+            self.adjustSize()
+        else:
+            self.adjustSize()
     
     def _show_param_info(self, idx):
         param = PARAMETER_DEFS.get(int(idx))
@@ -983,6 +1815,19 @@ class ParameterWindow(QMainWindow):
             self.info_text.setText(f"<b>{param.name}</b>")
         else:
             self.info_text.setText(f"Parameter {idx}")
+
+    def _param_display_name(self, idx):
+        """Friendly param name for dialogs: PROTECTED name, else the
+        ParamTable-derived definition name, else a raw 'P{n}' fallback.
+        (Fix: boot-scoped params like RFSensorType showed "P9" in the
+        Apply & Reboot offer — Greg 2026-09-25.)"""
+        name = self._PROTECTED_NAMES.get(int(idx))
+        if name:
+            return name
+        param = PARAMETER_DEFS.get(int(idx))
+        if param and param.name:
+            return param.name
+        return f"P{int(idx)+1}"
     
     def eventFilter(self, obj, event):
         if event.type() == QEvent.Enter:
@@ -1011,11 +1856,11 @@ class ParameterWindow(QMainWindow):
         
         # Main grid layout — two rows
         grid = QGridLayout()
-        grid.setHorizontalSpacing(4)
-        grid.setVerticalSpacing(4)
+        grid.setHorizontalSpacing(0)
+        grid.setVerticalSpacing(2)
         self._param_grid = grid
 
-        # Row 0: PID, General, Configuration, Battery
+        # Row 0: PID | General | Config | Battery | Filters
         pid_group = self._create_pid_group()
         grid.addWidget(pid_group, 0, 0)
 
@@ -1028,46 +1873,54 @@ class ParameterWindow(QMainWindow):
         batt_group = self._create_compact_group("Battery", self.MISC2_PARAMS)
         grid.addWidget(batt_group, 0, 3)
 
-        # Row 1: Navigation, Altitude, Filters, Fixed Wing
+        filt_group = self._create_filters_single_box()
+        grid.addWidget(filt_group, 0, 4)
+
+        # Row 1: Navigation | Altitude (2 cols) | Fixed Wing (2 cols)
         nav_group = self._create_two_col_compact_group("Navigation", self.NAVIGATION_PARAMS)
         grid.addWidget(nav_group, 1, 0)
 
-        alt_group = self._create_compact_group("Altitude", self.ALTITUDE_PARAMS)
+        # Altitude - make two columns using the two-col compact helper
+        alt_group = self._create_two_col_compact_group("Altitude", self.ALTITUDE_PARAMS)
+        alt_group.setMaximumWidth(440)  # 2x 220
+        self._add_altitude_readout(alt_group)
         grid.addWidget(alt_group, 1, 1)
 
-        filt_group = self._create_filters_group()
-        grid.addWidget(filt_group, 1, 2)
+        # Fixed Wing - double column box
+        fw_group = self._create_fixed_wing_two_col_box()
+        grid.addWidget(fw_group, 1, 2, 1, 2)
 
-        self._fw_group = self._create_fixed_wing_group()
-        grid.addWidget(self._fw_group, 1, 3)
+        # Make grid 4 columns
+        grid.setColumnStretch(0, 0)
+        grid.setColumnStretch(1, 0)
+        grid.setColumnStretch(2, 1)
+        grid.setColumnStretch(3, 1)
+        grid.setColumnStretch(4, 1)
 
-        self.param_layout.addLayout(grid)
+        # Wrap grid in a widget so Advanced toggle can show/hide it
+        grid_container = QWidget()
+        grid_container.setLayout(grid)
+        self._grid_container = grid_container
+        grid_container.setVisible(False)
+        # NOTE: added to param_layout in setup_ui after the Advanced checkbox so
+        # the grid renders below it (RC Config -> Aircraft Config -> checkbox -> grid)
         
         # Connect AF_TYPE combo to FW styling
         QTimer.singleShot(0, self._update_fw_style)
     
     def _update_fw_style(self):
-        """Style Fixed Wing group: normal when active, faint when inactive"""
-        if self._fw_group is None:
-            return
-        af_combo = self.params.get(int(ParamIndex.AF_TYPE))
-        if af_combo is None or not isinstance(af_combo, QComboBox):
-            self._fw_group.setEnabled(False)
-            return
-        # Reverse-lookup display name → enum value (combo items lack itemData)
-        text = af_combo.currentText()
-        idx = next((af.value for af, name in AIRFRAME_NAMES.items() if name == text), None)
-        if idx is None:
-            self._fw_group.setEnabled(False)
-            return
-        is_fw = AirframeType.ELEVON <= idx <= AirframeType.VTOL2
-        if is_fw:
-            self._fw_group.setStyleSheet("QGroupBox { font-weight: bold; border: 1px solid black; border-radius: 4px; margin-top: 6px; } QGroupBox::title { subcontrol-origin: margin; left: 6px; padding: 0 3px 0 3px; }")
-            self._fw_group.setEnabled(True)
-        else:
-            self._fw_group.setStyleSheet("QGroupBox { font-weight: bold; color: #bbb; border: 1px solid black; border-radius: 4px; margin-top: 6px; } QGroupBox::title { subcontrol-origin: margin; left: 6px; padding: 0 3px 0 3px; color: #bbb; }")
-            self._fw_group.setEnabled(False)
-    
+        if self._fw_group is not None:
+            af_combo = self._setup_widgets.get(int(ParamIndex.AF_TYPE)) if hasattr(self, '_setup_widgets') else None
+            if not isinstance(af_combo, QComboBox):
+                af_combo = self.params.get(int(ParamIndex.AF_TYPE))
+            is_fw = False
+            if isinstance(af_combo, QComboBox):
+                data = af_combo.currentData()
+                if data is not None:
+                    is_fw = self._category_for_af(int(data)) == 'FW'
+            self._fw_group.setVisible(is_fw)
+        self._apply_pid_view()
+
     def _create_rc_combined_group(self):
         """Create combined RC configuration + live monitoring group"""
         group = QGroupBox("RC Configuration")
@@ -1085,60 +1938,47 @@ class ParameterWindow(QMainWindow):
             }
         """)
         layout = QGridLayout()
-        layout.setHorizontalSpacing(3)
-        layout.setVerticalSpacing(1)
-        layout.setContentsMargins(4, 8, 4, 4)
+        layout.setHorizontalSpacing(4)
+        layout.setVerticalSpacing(2)
+        layout.setContentsMargins(4, 10, 4, 10)
 
-        # Column widths: [µs, bar, Ch, Func] repeated for left and right halves
-        col_widths = [35, 35, 42, 35]
-        col_stretch = [0, 1, 0, 0]
-        for half in range(2):
-            for c, w in enumerate(col_widths):
-                ci = half * 4 + c
-                layout.setColumnMinimumWidth(ci, w)
-                layout.setColumnStretch(ci, col_stretch[c])
+        for half in range(3):
+            ci = half * 4
+            layout.addWidget(self._header("µs"), 0, ci, Qt.AlignRight | Qt.AlignVCenter)
+            layout.addWidget(self._header("Ch"), 0, ci + 1, Qt.AlignLeft | Qt.AlignVCenter)
+            layout.addWidget(self._header("Func"), 0, ci + 3)
+            layout.setColumnMinimumWidth(ci, 36)
+            layout.setColumnMinimumWidth(ci + 2, 42)
 
-        # Left header
-        layout.addWidget(self._header("µs"), 0, 0)
-        layout.addWidget(self._header(""), 0, 1)
-        layout.addWidget(self._header("Ch"), 0, 2)
-        layout.addWidget(self._header("Func"), 0, 3)
-        # Right header
-        layout.addWidget(self._header("µs"), 0, 4)
-        layout.addWidget(self._header(""), 0, 5)
-        layout.addWidget(self._header("Ch"), 0, 6)
-        layout.addWidget(self._header("Func"), 0, 7)
+        # Bar-column header doubles as the unit flip button (percent default)
+        self.rc_unit_header = self._header("%")
+        layout.addWidget(self.rc_unit_header, 0, 1, Qt.AlignLeft | Qt.AlignVCenter)
+        self.rc_unit_btn = QToolButton()
+        self.rc_unit_btn.setText("%")
+        self.rc_unit_btn.setCheckable(True)
+        self.rc_unit_btn.setAutoRaise(True)
+        self.rc_unit_btn.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        self.rc_unit_btn.setToolTip("Toggle Rx value display: % (default) or raw µs")
+        self.rc_unit_btn.toggled.connect(self._toggle_rc_units)
+        layout.addWidget(self.rc_unit_btn, 0, 5, Qt.AlignLeft | Qt.AlignVCenter)
 
-        # right-align µs and Ch headers, left-align Func headers
-        for col in [0, 2, 4, 6]:
-            item = layout.itemAtPosition(0, col)
-            if item and item.widget():
-                item.widget().setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        for col in [3, 7]:
-            item = layout.itemAtPosition(0, col)
-            if item and item.widget():
-                item.widget().setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-
+        self.rc_channel_spins = []
         self.rc_value_labels = {}
         self.rc_progress_bars = {}
-        self.rc_channel_spins = []
-
         for fn_idx, (param_idx, func_name, default_ch) in enumerate(self.RC_MAP_PARAMS):
             col_offset = 4 * (fn_idx // 6)
             row = (fn_idx % 6) + 1
 
-            val_label = QLabel("---")
-            val_label.setStyleSheet("font-weight: bold;")
-            val_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            val_label.setFixedWidth(35)
-            layout.addWidget(val_label, row, col_offset)
-            self.rc_value_labels[fn_idx] = val_label
+            val = QLabel("---")
+            val.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            val.setFixedWidth(36)
+            layout.addWidget(val, row, col_offset)
+            self.rc_value_labels[fn_idx] = val
 
             bar = TickBar()
-            bar.setRange(900, 2100)
-            bar.setValue(1500)
-            bar.setMinimumWidth(35)
-            bar.setMinimumHeight(18)
+            bar.setRange(0, 1000, ticks=[500])
+            bar.setValue(0)
+            bar.setMinimumWidth(50)
             layout.addWidget(bar, row, col_offset + 1)
             self.rc_progress_bars[fn_idx] = bar
 
@@ -1148,15 +1988,12 @@ class ParameterWindow(QMainWindow):
             spin.setProperty("param_index", int(param_idx))
             spin.setProperty("fn_index", fn_idx)
             spin.valueChanged.connect(lambda v, i=int(param_idx), fn=fn_idx: self._rc_channel_changed(i, fn, v))
-            spin.setToolTip(f"{func_name} channel (0=none, 1-15=physical channel)")
+            spin.setToolTip(f"{func_name} channel slot (0 = first channel, 1..15 = subsequent)")
             spin.setMaximumWidth(42)
             spin.setMinimumWidth(38)
             spin.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
             spin.setMaximumHeight(18)
-            spin.setStyleSheet("""
-                QSpinBox { padding: 1px 2px; }
-                QSpinBox::up-button, QSpinBox::down-button { width: 12px; }
-            """)
+            spin.setStyleSheet(self.RC_CH_STYLE)
             layout.addWidget(spin, row, col_offset + 2)
             self.params[int(param_idx)] = spin
             self.rc_channel_spins.append(spin)
@@ -1166,9 +2003,59 @@ class ParameterWindow(QMainWindow):
             func_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
             layout.addWidget(func_label, row, col_offset + 3)
 
+        # Third column: spare channels 12-15, same cell layout, no assignment
+        self.rc_spare_labels = []
+        self.rc_spare_bars = []
+        self.rc_spare_spins = []
+        for i in range(4):
+            row = i + 1
+            val = QLabel("---")
+            val.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            val.setFixedWidth(36)
+            layout.addWidget(val, row, 8)
+            self.rc_spare_labels.append(val)
+
+            bar = TickBar()
+            bar.setRange(0, 1000, ticks=[500])
+            bar.setValue(0)
+            bar.setMinimumWidth(50)
+            layout.addWidget(bar, row, 9)
+            self.rc_spare_bars.append(bar)
+
+            spin = QSpinBox()
+            spin.setRange(0, 15)
+            spin.setValue(12 + i)
+            spin.setEnabled(False)
+            spin.setMaximumWidth(42)
+            spin.setMinimumWidth(38)
+            spin.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            spin.setMaximumHeight(18)
+            spin.setStyleSheet(self.RC_CH_STYLE)
+            spin.setProperty("_rc_style", self.RC_CH_STYLE)
+            spin.setToolTip("Unmapped Rx channel (no function assigned)")
+            layout.addWidget(spin, row, 10)
+            self.rc_spare_spins.append(spin)
+
+            func_label = QLabel(f"CH{13 + i}")
+            func_label.setStyleSheet("font-weight: bold;")
+            func_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+            layout.addWidget(func_label, row, 11)
+
+        layout.setColumnStretch(2, 1)
+        layout.setColumnStretch(6, 1)
+        layout.setColumnStretch(10, 1)
+        layout.setRowStretch(7, 1)
+
         group.setLayout(layout)
         return group
-    
+
+    def _toggle_rc_units(self, checked):
+        """Flip RC value display between percent (default) and raw microseconds"""
+        unit = "µs" if checked else "%"
+        self.rc_unit_btn.setText(unit)
+        self.rc_unit_header.setText(unit)
+        self.update_rc_display()
+
     def _create_motor_group(self):
         """Create motor/servo bargraph group"""
         group = QGroupBox("Motors / Servos")
@@ -1199,7 +2086,15 @@ class ParameterWindow(QMainWindow):
                 motor_layout.setColumnStretch(ci, col_stretch[c])
 
         motor_layout.addWidget(self._header("%"), 0, 0)
-        motor_layout.addWidget(self._header(""), 0, 1)
+        # Bar column header doubles as the unit flip button (percent default)
+        self.motor_unit_btn = QToolButton()
+        self.motor_unit_btn.setText("%")
+        self.motor_unit_btn.setCheckable(True)
+        self.motor_unit_btn.setAutoRaise(True)
+        self.motor_unit_btn.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        self.motor_unit_btn.setToolTip("Toggle motor display: % (default) or raw µs")
+        self.motor_unit_btn.toggled.connect(self._toggle_motor_units)
+        motor_layout.addWidget(self.motor_unit_btn, 0, 1, Qt.AlignLeft | Qt.AlignVCenter)
         motor_layout.addWidget(self._header("Ch"), 0, 2)
         motor_layout.addWidget(self._header("%"), 0, 3)
         motor_layout.addWidget(self._header(""), 0, 4)
@@ -1211,7 +2106,7 @@ class ParameterWindow(QMainWindow):
             if item and item.widget():
                 item.widget().setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
 
-        motor_names = ["M0", "M1", "M2", "M3", "M4", "M5", "M6", "M7", "M8", "M9", "M10", "M11"]
+        self.motor_names = ["FL", "BL", "FR", "BR", "M4", "M5", "M6", "M7", "M8", "M9", "M10", "M11"]
         for i in range(12):
             col_offset = 3 * (i // 6)
             row = (i % 6) + 1
@@ -1229,7 +2124,7 @@ class ParameterWindow(QMainWindow):
             bar.setMinimumHeight(18)
             motor_layout.addWidget(bar, row, col_offset + 1)
 
-            name = QLabel(motor_names[i])
+            name = QLabel(self.motor_names[i])
             name.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
             name.setStyleSheet("font-weight: bold;")
             name.setMinimumWidth(22)
@@ -1243,44 +2138,1240 @@ class ParameterWindow(QMainWindow):
         group.setLayout(motor_layout)
         return group
 
+    def _toggle_motor_units(self, checked):
+        """Flip motor display between percent (default) and raw microseconds"""
+        unit = "µs" if checked else "%"
+        self.motor_unit_btn.setText(unit)
+        if self._last_motor_fd is not None:
+            self._update_motor_display(self._last_motor_fd)
+
     def _update_motor_display(self, flight_data):
         """Update motor/servo bargraphs from flight data"""
+        self._last_motor_fd = flight_data
+        show_us = self.motor_unit_btn.isChecked()
+        has_nan = False
         if hasattr(flight_data, 'pwm') and flight_data.pwm:
             num_motors = min(len(flight_data.pwm), 10)
             for i in range(12):
                 if i < num_motors:
-                    pwm_val = flight_data.pwm[i]
-                    scaled_val = max(0, min(1000, int((pwm_val - 1000) * 1.0)))
+                    # RawPW idle-zero-referenced: 0=1000uS, 0.5=1500uS,
+                    # 1.0=2000uS
+                    raw = flight_data.pwm[i]
+                    if not math.isfinite(raw):
+                        # A non-finite actuator value (seen 2026-09-18: the FC's
+                        # emulator shipped NaN pwm) must never reach int()/round()
+                        # here — this runs in a 50 ms QTimer slot, so an unhandled
+                        # ValueError aborts the whole GCS. Show it as invalid and
+                        # report it once per episode instead.
+                        has_nan = True
+                        self.motor_bars[i].setValue(0)
+                        self.motor_pct_labels[i].setText("---")
+                        self.motor_name_labels[i].setText(self.motor_names[i] if i < 4 else f"M{i}")
+                        self.motor_pct_labels[i].setStyleSheet(
+                            "background-color: #cc0000; color: white; font-weight: bold;"
+                        )
+                        continue
+                    pwm_us = (raw + 1.0) * 1000.0
+                    scaled_val = max(0, min(1000, int(pwm_us - 1000)))
+                    pct = int(scaled_val / 10)
                     self.motor_bars[i].setRange(0, 1000, ticks=[500])
                     self.motor_bars[i].setValue(scaled_val)
-                    self.motor_pct_labels[i].setText(f"{int(scaled_val / 10)}%")
-                    self.motor_name_labels[i].setText(f"M{i}")
-                    pct = int(scaled_val / 10)
+                    label = f"{round(pwm_us)}" if show_us else f"{pct}%"
+                    self.motor_pct_labels[i].setText(label)
+                    self.motor_name_labels[i].setText(self.motor_names[i] if i < 4 else f"M{i}")
                     if pct < 10 or pct > 80:
                         bg = "#f39c12"
                     else:
-                        bg = "#555"
+                        bg = "#27ae60"
                     self.motor_pct_labels[i].setStyleSheet(
-                        f"background-color: {bg}; font-weight: bold;"
+                        f"background-color: {bg}; color: white; font-weight: bold;"
                     )
                 else:
                     self.motor_bars[i].setValue(0)
-                    self.motor_pct_labels[i].setText("0%")
-                    self.motor_name_labels[i].setText(f"M{i}")
+                    self.motor_pct_labels[i].setText("---" if show_us else "0%")
+                    self.motor_name_labels[i].setText(self.motor_names[i] if i < 4 else f"M{i}")
                     self.motor_pct_labels[i].setStyleSheet(
                         "background-color: #999; font-weight: bold;"
                     )
+            if has_nan:
+                if not self._motor_nan_warned:
+                    self._motor_nan_warned = True
+                    self._log("Non-finite (NaN) motor/servo value from FC — "
+                              "bars flagged invalid")
+            else:
+                self._motor_nan_warned = False
         else:
             for i in range(12):
                 self.motor_bars[i].setValue(0)
-                self.motor_pct_labels[i].setText("0%")
-                self.motor_name_labels[i].setText(f"M{i}")
+                self.motor_pct_labels[i].setText("---" if show_us else "0%")
+                self.motor_name_labels[i].setText(self.motor_names[i] if i < 4 else f"M{i}")
                 self.motor_pct_labels[i].setStyleSheet(
                     "background-color: #999; font-weight: bold;"
                 )
     
+    def _create_setup_group(self):
+        """Create Setup section with FC param widgets only"""
+        group = QGroupBox("Aircraft Config")
+        group.setStyleSheet("""
+            QGroupBox { font-weight: bold; border: 1px solid #e74c3c; border-radius: 4px; margin-top: 6px; }
+            QGroupBox::title { subcontrol-origin: margin; left: 6px; padding: 0 3px 0 3px; color: #e74c3c; }
+        """)
+        layout = QVBoxLayout()
+        layout.setSpacing(3)
+        layout.setContentsMargins(6, 10, 6, 6)
+
+        self._setup_widgets = {}
+        self._phys_widgets = {}
+        self._setup_group = group
+        self._setup_layout = layout
+
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(6)
+        grid.setVerticalSpacing(2)
+        grid.setContentsMargins(0, 0, 0, 0)
+
+        setup_params = [
+            (ParamIndex.RX_TYPE, "Rx Type", "combo", 0,
+             list(RX_TYPE_NAMES.values()), None),
+            (ParamIndex.FAILSAFE_ACTION, "FS Action", "combo", 0,
+             list(FAILSAFE_ACTION_NAMES.values()), None),
+            (ParamIndex.FAILSAFE_DELAY, "FS Delay (s)", "spin", 0, None, (2, 15, 5)),
+            (ParamIndex.ESC_TYPE, "ESC Protocol", "combo", 0,
+             list(ESC_TYPE_NAMES.values()), None),
+            (ParamIndex.RF_SENSOR_TYPE, "RF Module", "combo", 0,
+             list(RF_TYPE_NAMES.values()), None),
+            (ParamIndex.AS_SENSOR_TYPE, "Airspeed Sensor", "combo", 0,
+             list(AS_SENSOR_TYPE_NAMES.values()), None),
+            (ParamIndex.BATTERY_CAPACITY, "Battery (mAh)", "spin", 0, None, None),
+            (ParamIndex.NAV_MAG_VAR, "Mag Decl (°)", "spin", 1, None, None),
+            (ParamIndex.VOLT_SCALE, "Volt Scale", "spin", 1, None, None),
+            (ParamIndex.CURRENT_SCALE, "Curr Scale (A)", "spin", 1, None, None),
+        ]
+        for i, (idx, name, wtype, dec, items, data) in enumerate(setup_params):
+            row = i // 3
+            col = i % 3
+            idx_int = int(idx)
+            if wtype == "combo":
+                combo = QComboBox()
+                for j, item in enumerate(items):
+                    d = data[j] if data is not None else j
+                    combo.addItem(item, d)
+                combo.setMaximumWidth(120)
+                combo.setEditable(True)
+                combo.lineEdit().setReadOnly(True)
+                combo.lineEdit().setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                combo.setStyleSheet("QComboBox { padding: 1px 2px; } QComboBox::drop-down { width: 16px; }")
+                combo.currentIndexChanged.connect(lambda v, ii=idx_int: self._setup_sync_to_advanced(ii))
+                self._setup_widgets[idx_int] = combo
+                grid.addWidget(combo, row, col * 2, Qt.AlignRight | Qt.AlignVCenter)
+                lbl = QLabel(name)
+                lbl.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+                lbl.setStyleSheet("font-weight: normal;")
+                grid.addWidget(lbl, row, col * 2 + 1)
+            else:
+                spin = QDoubleSpinBox()
+                if isinstance(data, tuple) and len(data) == 3:
+                    spin.setRange(data[0], data[1])
+                    spin.setValue(data[2])
+                else:
+                    spin.setRange(0, 9999)
+                spin.setDecimals(dec)
+                spin.setMaximumWidth(80)
+                spin.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                spin.setStyleSheet("QDoubleSpinBox { padding: 1px 2px; }")
+                spin.valueChanged.connect(lambda v, ii=idx_int: self._setup_sync_to_advanced(ii))
+                self._setup_widgets[idx_int] = spin
+                grid.addWidget(spin, row, col * 2, Qt.AlignRight | Qt.AlignVCenter)
+                lbl = QLabel(name)
+                lbl.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+                lbl.setStyleSheet("font-weight: normal;")
+                grid.addWidget(lbl, row, col * 2 + 1)
+
+        layout.addLayout(grid)
+
+        # Character slider — dev-gated (2026-09-13 decision: HIDDEN in the shipped
+        # GCS, see wiki/Session_Report_CascadeCrossCheck_Sep13.md §5.1c). The
+        # fleet character-curve machinery computes gains from AF type + slider +
+        # physics, but angle gains are now locked-derived
+        # (QKp = RateMax/(2·sin(AngleMax/2))) and rate gains are pot-bracketed
+        # (Ch10) + trace-measured per airframe, so the slider has no seat in the
+        # field workflow. Set UAVXGS_DEV_TUNE_SLIDER=1 to restore the full row
+        # (all widgets are still constructed so compute_defaults /
+        # _get_scale_factors / reset_to_computed / metadata round-trip stay
+        # intact and reachable in a dev session).
+        self._tune_slider_dev = os.environ.get("UAVXGS_DEV_TUNE_SLIDER", "0") == "1"
+
+        slider_row = QHBoxLayout()
+        slider_row.setSpacing(4)
+        lbl_con = QLabel("Steady")
+        lbl_con.setStyleSheet("font-weight: normal; color: #666;")
+        lbl_con.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        slider_row.addWidget(lbl_con)
+
+        self._character_slider = QSlider(Qt.Horizontal)
+        self._character_slider.setRange(0, 100)
+        self._character_slider.setValue(50)
+        self._character_slider.setTickPosition(QSlider.TicksBelow)
+        self._character_slider.setTickInterval(10)
+        self._character_slider.setMinimumWidth(80)
+        self._character_slider.valueChanged.connect(self._on_character_slider)
+        slider_row.addWidget(self._character_slider, 1)
+
+        lbl_ag = QLabel("Frisky")
+        lbl_ag.setStyleSheet("font-weight: normal; color: #666;")
+        lbl_ag.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        slider_row.addWidget(lbl_ag)
+
+        self._character_value_label = QLabel("50%")
+        self._character_value_label.setMinimumWidth(28)
+        self._character_value_label.setAlignment(Qt.AlignCenter)
+        self._character_value_label.setStyleSheet("font-weight: bold; color: #3498db;")
+        slider_row.addWidget(self._character_value_label)
+
+        compute_btn = QPushButton("Compute")
+        compute_btn.setToolTip("Compute tuning params from slider + physical descriptors")
+        compute_btn.setStyleSheet("padding: 2px 6px; font-weight: bold;")
+        compute_btn.clicked.connect(self.compute_defaults)
+        slider_row.addWidget(compute_btn)
+
+        reset_btn = QPushButton("Reset")
+        reset_btn.setToolTip("Reset to last computed values")
+        reset_btn.setStyleSheet("padding: 2px 6px;")
+        reset_btn.clicked.connect(self.reset_to_computed)
+        slider_row.addWidget(reset_btn)
+
+        sim_btn = QPushButton("Sim")
+        sim_btn.setToolTip("Run the full robustness report (2 seeds, detailed) — "
+                           "tuning edits & Compute already auto-check in the status bar")
+        sim_btn.setStyleSheet("padding: 2px 6px; font-weight: bold; color: #8e44ad;")
+        sim_btn.clicked.connect(self.run_robustness_sim)
+        self._sim_btn = sim_btn
+        slider_row.addWidget(sim_btn)
+
+        # Hidden by default: slider + Steady/Frisky/% + Compute/Reset. The Sim
+        # button stays visible — it runs the robustness report, which is a
+        # genuine tuning-check instrument independent of the fleet curves.
+        if not self._tune_slider_dev:
+            for w in (lbl_con, self._character_slider, lbl_ag,
+                      self._character_value_label, compute_btn, reset_btn):
+                w.setVisible(False)
+
+        layout.addLayout(slider_row)
+
+        group.setLayout(layout)
+        return group
+
+    def _create_physics_group(self):
+        """Create Physics box: AF_TYPE on top, physical descriptors below"""
+        group = QGroupBox("Physics")
+        group.setStyleSheet("""
+            QGroupBox { font-weight: bold; border: 1px solid #9b59b6; border-radius: 4px; margin-top: 6px; }
+            QGroupBox::title { subcontrol-origin: margin; left: 6px; padding: 0 3px 0 3px; color: #9b59b6; }
+        """)
+        layout = QVBoxLayout()
+        layout.setSpacing(3)
+        layout.setContentsMargins(6, 10, 6, 6)
+
+        self._phys_widgets = {}
+        self._phys_group = group
+
+        # AF_TYPE combo — label AFTER combo
+        af_row = QHBoxLayout()
+        af_row.setSpacing(4)
+        af_combo = QComboBox()
+        for af in ALL_AIRFRAMES:
+            af_combo.addItem(AIRFRAME_NAMES[af], af.value)
+        af_combo.setEditable(True)
+        af_combo.lineEdit().setReadOnly(True)
+        af_combo.lineEdit().setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        af_combo.setStyleSheet("QComboBox { padding: 1px 2px; } QComboBox::drop-down { width: 16px; }")
+        af_combo.currentIndexChanged.connect(lambda v, ii=int(ParamIndex.AF_TYPE): self._setup_sync_to_advanced(ii))
+        self._setup_widgets[int(ParamIndex.AF_TYPE)] = af_combo
+        af_row.addWidget(af_combo)
+        lbl = QLabel("Airframe Type")
+        lbl.setStyleSheet("font-weight: normal;")
+        af_row.addWidget(lbl)
+        af_row.addStretch(1)
+        layout.addLayout(af_row)
+
+        # Physical descriptor grid — rebuilt when AF_TYPE changes
+        self._phys_grid = QGridLayout()
+        self._phys_grid.setHorizontalSpacing(6)
+        self._phys_grid.setVerticalSpacing(2)
+        self._phys_grid.setContentsMargins(0, 0, 0, 0)
+        self._phys_row = 0
+        self._build_phys_row()
+        layout.addLayout(self._phys_grid)
+
+        self._phys_hover_lbl = QLabel("")
+        self._phys_hover_lbl.setStyleSheet("font-weight: bold; font-size: 10px;")
+        self._phys_hover_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self._phys_hover_lbl.hide()
+        layout.addWidget(self._phys_hover_lbl)
+
+        group.setLayout(layout)
+        return group
+
+    def _build_phys_row(self):
+        """Build or rebuild the physical descriptor row based on current AF_TYPE category"""
+        if not hasattr(self, '_phys_grid') or not hasattr(self, '_phys_row'):
+            return
+        grid = self._phys_grid
+        row = self._phys_row
+
+        # Clear old widgets from grid
+        for key, widget in self._phys_widgets.items():
+            grid.removeWidget(widget)
+            widget.setParent(None)
+            widget.deleteLater()
+        self._phys_widgets.clear()
+
+        # Clear old labels too
+        while grid.count():
+            item = grid.takeAt(0)
+            w = item.widget()
+            if w:
+                w.setParent(None)
+                w.deleteLater()
+
+        af_combo = self._setup_widgets.get(int(ParamIndex.AF_TYPE))
+        cat = 'MR'
+        af_type_int = 4  # default to Quad
+        if af_combo and isinstance(af_combo, QComboBox):
+            af_data = af_combo.currentData()
+            if af_data is not None:
+                af_type_int = int(af_data)
+                cat = self._category_for_af(af_type_int)
+        self._current_af_type = cat
+        self._current_af_type_int = af_type_int
+
+        if cat == 'FW':
+            descriptors = self._FW_PHYS_DESCRIPTORS
+        elif cat == 'LAND':
+            descriptors = self._LAND_PHYS_DESCRIPTORS
+        elif cat == 'NONE':
+            descriptors = []
+        else:
+            # Use airframe-specific defaults if available, otherwise fall back to generic MR
+            af_specific = self._MR_PHYS_DEFAULTS.get(self._current_af_type_int)
+            if af_specific:
+                descriptors = af_specific
+            else:
+                descriptors = self._MR_PHYS_DESCRIPTORS
+
+        for i, (key, label, dec, default, tooltip) in enumerate(descriptors):
+            row = i // 3
+            col = i % 3
+            if dec is None:
+                edit = QLineEdit()
+                edit.setText(str(default))
+                edit.setMaximumWidth(70)
+                edit.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                edit.setToolTip(tooltip)
+                edit.setStyleSheet("QLineEdit { padding: 1px 2px; }")
+                edit.textChanged.connect(lambda t, k=key: self._phys_changed(k))
+                self._phys_widgets[key] = edit
+                grid.addWidget(edit, row, col * 2)
+            else:
+                spin = QDoubleSpinBox()
+                spin.setDecimals(dec)
+                spin.setMaximumWidth(70)
+                spin.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                spin.setToolTip(tooltip)
+                spin.setStyleSheet("QDoubleSpinBox { padding: 1px 2px; }")
+                spin.valueChanged.connect(lambda v, k=key: self._phys_changed(k))
+                # Sensible ranges to catch obviously wrong values
+                if 'AUW' in key:
+                    spin.setRange(50, 20000)
+                elif 'ARM' in key or 'WING' in key or 'CHORD' in key or 'TRACK' in key:
+                    spin.setRange(10, 5000)
+                elif 'WHEEL' in key:
+                    spin.setRange(1, 50)
+                elif 'THRUST_G' in key:
+                    spin.setRange(1, 5000)
+                elif 'THRUST_A' in key:
+                    spin.setRange(0.1, 500)
+                elif 'THRUST_V' in key:
+                    spin.setRange(1, 60)
+                elif 'COUNT' in key:
+                    spin.setRange(1, 16)
+                else:
+                    spin.setRange(0, 99999)
+                spin.setValue(default)
+                self._phys_widgets[key] = spin
+                grid.addWidget(spin, row, col * 2)
+            lbl = QLabel(label)
+            lbl.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+            lbl.setStyleSheet("font-weight: normal;")
+            lbl.setToolTip(tooltip)
+            grid.addWidget(lbl, row, col * 2 + 1)
+
+    @staticmethod
+    def _parse_prop(text: str) -> tuple:
+        """Parse prop string 'DxP' or 'DxPxB' → (diameter, pitch, blades)."""
+        text = text.strip()
+        parts = text.split('x')
+        try:
+            dia = float(parts[0])
+            pitch = float(parts[1]) if len(parts) > 1 else dia * 0.5
+            blades = int(parts[2]) if len(parts) > 2 else 2
+        except (ValueError, IndexError):
+            return 10.0, 5.0, 2
+        return dia, pitch, blades
+
+    @staticmethod
+    def _format_prop(dia: float, pitch: float, blades: int = 2) -> str:
+        """Format (diameter, pitch, blades) → 'DxP' or 'DxPxB'."""
+        dia_s = f"{dia:.0f}" if dia == int(dia) else f"{dia:.1f}"
+        pitch_s = f"{pitch:.1f}" if pitch != int(pitch) else f"{pitch:.0f}"
+        if blades == 2:
+            return f"{dia_s}x{pitch_s}"
+        return f"{dia_s}x{pitch_s}x{blades}"
+
+    def _phys_changed(self, key):
+        """Handle change to a physical descriptor — recompute derived values and check sanity"""
+        phys_meta = {}
+        for k, widget in self._phys_widgets.items():
+            if isinstance(widget, QDoubleSpinBox):
+                phys_meta[k] = str(int(widget.value())) if widget.decimals() == 0 else str(widget.value())
+            elif isinstance(widget, QLineEdit):
+                dia, pitch, blades = self._parse_prop(widget.text())
+                phys_meta['PHYS_PROP_INCH'] = str(dia)
+                phys_meta['PHYS_PROP_PITCH_INCH'] = str(pitch)
+                phys_meta['PHYS_PROP_BLADES'] = str(blades)
+        self._current_phys_meta = self._compute_physics_from_descriptors(phys_meta)
+
+        if hasattr(self, '_phys_hover_lbl'):
+            cat = self._category_for_af(self._current_af_type)
+            if cat == 'NONE':
+                self._phys_hover_lbl.hide()
+                return
+            thr = float(self._current_phys_meta.get('PHYS_CRUISE_THR') or self._current_phys_meta.get('PHYS_HOVER_THR', 0.5))
+            label = "Est Cruise Throttle"
+            self._phys_hover_lbl.setText(f"{label}: {thr:.0%}")
+            if thr < self._HOVER_THR_MIN:
+                self._phys_hover_lbl.setStyleSheet("color: #e74c3c; font-weight: bold; font-size: 10px;")
+                self._phys_hover_lbl.show()
+            elif thr > self._HOVER_THR_MAX:
+                self._phys_hover_lbl.setStyleSheet("color: #e74c3c; font-weight: bold; font-size: 10px;")
+                self._phys_hover_lbl.show()
+            else:
+                self._phys_hover_lbl.setStyleSheet("color: #27ae60; font-weight: bold; font-size: 10px;")
+                self._phys_hover_lbl.show()
+
+    # Old → new metadata key migration (backward compat with pre-existing .af files)
+    _PHYS_KEY_MAP = {
+        'PHYS_MASS_KG': 'PHYS_AUW_G',
+        'PHYS_ARM_LEN_M': 'PHYS_ARM_MM',
+        'PHYS_PROP_DIAMETER_INCH': 'PHYS_PROP_INCH',
+    }
+    _PHYS_CONVERSIONS = {
+        'PHYS_MASS_KG': lambda v: float(v) * 1000,      # kg → g
+        'PHYS_ARM_LEN_M': lambda v: float(v) * 1000,     # m → mm
+        'PHYS_PROP_DIAMETER_INCH': lambda v: float(v),    # same units
+    }
+
+    def _load_phys_from_metadata(self, meta):
+        """Populate physical descriptor widgets from .af metadata.
+
+        Handles backward compatibility: converts old PHYS_MASS_KG→PHYS_AUW_G,
+        PHYS_ARM_LEN_M→PHYS_ARM_MM, etc.
+        """
+        normalized = {}
+        for k, v in meta.items():
+            if k in self._PHYS_KEY_MAP:
+                new_key = self._PHYS_KEY_MAP[k]
+                try:
+                    converted = self._PHYS_CONVERSIONS[k](v)
+                    if new_key == 'PHYS_AUW_G':
+                        normalized[new_key] = str(int(converted))
+                    elif new_key == 'PHYS_ARM_MM':
+                        normalized[new_key] = str(int(converted))
+                    else:
+                        normalized[new_key] = str(converted)
+                except (ValueError, TypeError):
+                    normalized[new_key] = v
+            else:
+                normalized[k] = v
+        # Backward compat: old PHYS_MOTOR_W → derive thrust/current/voltage
+        if 'PHYS_MOTOR_W' in normalized and 'PHYS_MOTOR_THRUST_G' not in normalized:
+            try:
+                motor_w = float(normalized.pop('PHYS_MOTOR_W'))
+                normalized['PHYS_MOTOR_THRUST_G'] = str(int(motor_w * 3.0))
+                normalized['PHYS_MOTOR_THRUST_A'] = f'{motor_w / 14.8:.1f}'
+                normalized['PHYS_MOTOR_THRUST_V'] = '14.8'
+            except (ValueError, TypeError):
+                pass
+        normalized.setdefault('PHYS_PROP_BLADES', '2')
+        if 'PHYS_PROP_INCH' in normalized and 'PHYS_PROP_PITCH_INCH' not in normalized:
+            try:
+                normalized['PHYS_PROP_PITCH_INCH'] = str(float(normalized['PHYS_PROP_INCH']) / 2)
+            except (ValueError, TypeError):
+                pass
+        for key, widget in self._phys_widgets.items():
+            if isinstance(widget, QLineEdit) and key == 'PHYS_PROP':
+                prop_in = normalized.get('PHYS_PROP_INCH')
+                pitch_in = normalized.get('PHYS_PROP_PITCH_INCH')
+                blades = normalized.get('PHYS_PROP_BLADES', '2')
+                if prop_in and pitch_in:
+                    text = self._format_prop(float(prop_in), float(pitch_in), int(blades))
+                    widget.blockSignals(True)
+                    widget.setText(text)
+                    widget.blockSignals(False)
+            elif key in normalized:
+                try:
+                    val = float(normalized[key])
+                    widget.blockSignals(True)
+                    widget.setValue(val)
+                    widget.blockSignals(False)
+                except (ValueError, TypeError):
+                    pass
+        self._phys_changed(next(iter(self._phys_widgets.keys()), None) or '')
+
+    def _phys_to_metadata(self):
+        """Collect current physical descriptor values as metadata dict"""
+        result = {}
+        for key, widget in self._phys_widgets.items():
+            if isinstance(widget, QDoubleSpinBox):
+                val = widget.value()
+                result[key] = str(int(val)) if widget.decimals() == 0 else str(val)
+            elif isinstance(widget, QLineEdit) and key == 'PHYS_PROP':
+                dia, pitch, blades = self._parse_prop(widget.text())
+                result['PHYS_PROP_INCH'] = str(dia)
+                result['PHYS_PROP_PITCH_INCH'] = str(pitch)
+                result['PHYS_PROP_BLADES'] = str(blades)
+        if result:
+            result = self._compute_physics_from_descriptors(result)
+        return result
+
+    def _setup_sync_to_advanced(self, idx_int):
+        """Sync setup widget value → advanced grid widget"""
+        setup_w = self._setup_widgets.get(idx_int)
+        adv_w = self.params.get(idx_int)
+        if not setup_w or not adv_w:
+            return
+        if isinstance(setup_w, QComboBox) and isinstance(adv_w, QComboBox):
+            data = setup_w.currentData()
+            if data is not None:
+                adv_idx = self._resolve_combo_index(adv_w, int(data))
+                adv_w.blockSignals(True)
+                adv_w.setCurrentIndex(adv_idx)
+                adv_w.blockSignals(False)
+            self.dirty_params.add(idx_int)
+            self.combo_changed(idx_int, int(data) if data is not None else 0)
+            if idx_int == int(ParamIndex.AF_TYPE):
+                self._build_phys_row()
+        elif isinstance(setup_w, QDoubleSpinBox) and isinstance(adv_w, QDoubleSpinBox):
+            val = setup_w.value()
+            adv_w.blockSignals(True)
+            adv_w.setValue(val)
+            adv_w.blockSignals(False)
+            self.dirty_params.add(idx_int)
+            self.param_changed(idx_int, val)
+
+    def sync_setup_from_advanced(self):
+        """Sync advanced grid widget values → setup widgets (call after load/read)"""
+        for idx_int, setup_w in self._setup_widgets.items():
+            adv_w = self.params.get(idx_int)
+            if not adv_w:
+                continue
+            if isinstance(setup_w, QComboBox) and isinstance(adv_w, QComboBox):
+                adv_data = adv_w.currentData()
+                if adv_data is not None:
+                    s_idx = self._resolve_combo_index(setup_w, int(adv_data))
+                    setup_w.blockSignals(True)
+                    setup_w.setCurrentIndex(s_idx)
+                    setup_w.blockSignals(False)
+            elif isinstance(setup_w, QDoubleSpinBox) and isinstance(adv_w, QDoubleSpinBox):
+                setup_w.blockSignals(True)
+                setup_w.setValue(adv_w.value())
+                setup_w.blockSignals(False)
+        if hasattr(self, '_phys_grid'):
+            self._build_phys_row()
+
+    def _on_character_slider(self, value):
+        """Update the character label when slider moves"""
+        self._character_value_label.setText(f"{value}%")
+
+    def compute_defaults(self):
+        """Compute all tuning params from AF type + character slider position + physical descriptors.
+
+        The _PARAM_CURVES define base ranges for a reference MR/FW.
+        Physics scaling adjusts these ranges based on the actual aircraft's
+        mass, arm/wingspan, etc. from the Setup physical descriptor fields.
+        """
+        slider_pct = self._character_slider.value() / 100.0
+        af_combo = self.params.get(int(ParamIndex.AF_TYPE))
+        cat = 'MR'
+        af_type_int = 4
+        if af_combo and isinstance(af_combo, QComboBox):
+            af_data = af_combo.currentData()
+            if af_data is not None:
+                af_type_int = int(af_data)
+                cat = self._category_for_af(af_type_int)
+
+        scale_factors = self._get_scale_factors(cat)
+
+        # Type-conditioned curves: FW airframes need different yaw/comp references
+        # than the MR-anchored base dict (evidence: Phoenix yaw family).
+        curves = dict(self._PARAM_CURVES)
+        if cat == 'FW':
+            curves.update(self._PARAM_CURVES_FW)
+
+        computed = {}
+        for idx_str, (conservative, aggressive) in curves.items():
+            base_val = conservative + slider_pct * (aggressive - conservative)
+            sf = scale_factors.get(idx_str, 1.0)
+            computed[idx_str] = base_val * sf
+
+        self._computed_values = computed.copy()
+        self._computed_slider_pos = self._character_slider.value()
+
+        for idx_str, display_val in computed.items():
+            widget = self.params.get(idx_str)
+            if widget is None:
+                continue
+            widget.blockSignals(True)
+            if isinstance(widget, QDoubleSpinBox):
+                widget.setValue(display_val)
+            widget.blockSignals(False)
+            self.dirty_params.add(idx_str)
+
+        caveats = self._cascade_integrity_caveats(computed)
+        self._cascade_warnings = caveats
+        if caveats:
+            caveat_str = "\n".join(caveats)
+            print(f"⚠️ Cascade integrity caveats: {len(caveats)}")
+            for c in caveats:
+                print(f"   - {c}")
+            if hasattr(self, '_sim_btn') and self._sim_btn:
+                self._sim_btn.setText(f"Cascade caveats: {len(caveats)}")
+            new_msg = self._last_caveat_msg != caveat_str
+            self._last_caveat_msg = caveat_str
+            self.status_label.setText(f"⚡ {len(caveats)} cascade caveat(s) — see console / sim button tooltip")
+            self.status_label.setStyleSheet("color: #e67e22; font-weight: bold;")
+            if self._warn_cascade_dialog and new_msg:
+                QMessageBox.warning(self, "Cascade Integrity Caveats", caveat_str
+                                    + "\n\nValues applied as-is — verify before flight, or reduce "
+                                      "gains toward authority within the 20–30% band.")
+        else:
+            self._last_caveat_msg = ""
+            self.status_label.setText(f"Computed {len(computed)} params (Character={self._character_slider.value()}%)")
+            self.status_label.setStyleSheet("color: #3498db;")
+
+        self.update_config_display()
+        self._schedule_sim_check()
+
+    def _cascade_integrity_caveats(self, computed):
+        """Report cascade-integrity caveats for the just-computed tuning.
+
+        Mirrors control.c:584 — the outer quaternion angle loop's rate setpoint is
+        clamped to A[axis].R.Max for roll/pitch and  min(A[Yaw].R.Max,
+        Nav.MaxHeadingRate) for yaw.  Authored rate limits are stored in FC raw
+        rad/s with PARAM_DISPLAY_MULT 57.296 (deg/s display), so divide back.
+
+        Checks:
+          1. 2·sin(Θmax/2)·Kp  ≤ maxCmdRate   (P-path must not exceed the cascade cap)
+          2. IntLim           ≤ maxCmdRate  (hard windup guard: an I-term above the
+             clamp can never discharge → saturates the loop)
+          3. IntLim           ≥ 0.20·maxCmdRate *and* ≤ 0.30·maxCmdRate
+                       (tune rule — keep QP the main driver, I just trims)
+
+        Returns a list of caveat strings (empty = OK).
+        """
+        RAD2DEG = 57.29577951308232
+
+        # 3 angle-axes: tag of QP, QI-limit, max-angle (yaw: use π, Qa saturates 1)
+        axes = [
+            # (axis-key, Kp-tag, I-tag, intLim-tag, maxAngle-tag, maxRate-tag(s))
+            ("Roll", int(ParamIndex.ROLL_ANGLE_Q_KP), int(ParamIndex.ROLL_ANGLE_Q_KI),
+             int(ParamIndex.ROLL_ANGLE_Q_INT_LIMIT), int(ParamIndex.MAX_ROLL_ANGLE),
+             (int(ParamIndex.MAX_ROLL_RATE),)),
+            ("Pitch", int(ParamIndex.PITCH_ANGLE_Q_KP), int(ParamIndex.PITCH_ANGLE_Q_KI),
+             int(ParamIndex.PITCH_ANGLE_Q_INT_LIMIT), int(ParamIndex.MAX_PITCH_ANGLE),
+             (int(ParamIndex.MAX_PITCH_RATE),)),
+            ("Yaw", int(ParamIndex.YAW_ANGLE_Q_KP), int(ParamIndex.YAW_ANGLE_Q_KI),
+             int(ParamIndex.YAW_ANGLE_Q_INT_LIMIT), None,
+             (int(ParamIndex.MAX_YAW_RATE), int(ParamIndex.MAX_HEADING_RATE))),
+        ]
+        caveats = []
+        for name, kp_tag, ki_tag, il_tag, ang_tag, rate_tags in axes:
+            kp = computed.get(kp_tag)
+            il = computed.get(il_tag)
+            if kp is None or il is None:
+                continue
+            # max commanded rate (rad/s) = min of the rate caps
+            caps = []
+            for rt in rate_tags:
+                v = computed.get(rt)
+                if v is None:
+                    v = self._param_widget_display(rt)
+                if v is not None and v > 0:
+                    caps.append(v)
+            if not caps:
+                continue
+            max_cmd = min(caps) / RAD2DEG
+            if max_cmd <= 0:
+                continue
+            # angle max (rad)
+            if ang_tag is not None:
+                a_deg = computed.get(ang_tag)
+                if a_deg is not None:
+                    ang_rad = a_deg / RAD2DEG
+                    qp_demand = 2.0 * math.sin(ang_rad / 2.0) * kp
+                else:
+                    qp_demand = 2.0 * kp
+            else:
+                # Yaw: up to 180° heading error → sin(π/2)=1 → Qa=1
+                qp_demand = 2.0 * kp
+            # Item 1: P-path
+            if qp_demand > max_cmd * 1.02:
+                caveats.append(
+                    f"{name}: P-path can demand {qp_demand:.2f} rad/s at max error "
+                    f"> max commanded {max_cmd:.2f} rad/s — gain saturates the rate cap")
+            # Item 2: hard windup clamp
+            if il > max_cmd:
+                caveats.append(
+                    f"{name}: I-limit {il:.2f} rad/s exceeds max commanded "
+                    f"{max_cmd:.2f} rad/s — integrator can never discharge (windup)")
+            # Item 3: 20–30% band tune rule
+            elif il > 0.30 * max_cmd:
+                caveats.append(
+                    f"{name}: I-limit {il:.2f} rad/s = {100.0*il/max_cmd:.0f}% of "
+                    f"max commanded {max_cmd:.2f} rad/s — above the 20–30% band "
+                    f"(keep QP the main driver)")
+            elif il < 0.20 * max_cmd:
+                # I-limit below the band is acceptable (I only trims) — informational
+                pass
+        return caveats
+
+    def _param_widget_display(self, idx: int) -> Optional[float]:
+        """Read a param's current display-float if it isn't in the computed set."""
+        if not hasattr(self, 'params'):
+            return None
+        w = self.params.get(idx)
+        if w is None:
+            return None
+        if isinstance(w, QDoubleSpinBox):
+            return w.value()
+        if isinstance(w, QComboBox):
+            try:
+                return float(w.currentData())
+            except (TypeError, ValueError):
+                return None
+        return None
+
+    def _check_cascade_sanity(self):
+        """Trigger a cascade caveat recheck when any angle/rate spinbox fires.
+
+        Reads the LIVE widget values (manual edits, not just Compute) and
+        reports whether the current slider/tune pushes past the 20–30% I rule
+        or the P-path rate cap.
+        """
+        tag_values = {}
+        for t in (int(ParamIndex.ROLL_ANGLE_Q_KP), int(ParamIndex.ROLL_ANGLE_Q_KI),
+                  int(ParamIndex.ROLL_ANGLE_Q_INT_LIMIT), int(ParamIndex.MAX_ROLL_ANGLE),
+                  int(ParamIndex.PITCH_ANGLE_Q_KP), int(ParamIndex.PITCH_ANGLE_Q_KI),
+                  int(ParamIndex.PITCH_ANGLE_Q_INT_LIMIT), int(ParamIndex.MAX_PITCH_ANGLE),
+                  int(ParamIndex.YAW_ANGLE_Q_KP), int(ParamIndex.YAW_ANGLE_Q_KI),
+                  int(ParamIndex.YAW_ANGLE_Q_INT_LIMIT),
+                  int(ParamIndex.MAX_ROLL_RATE), int(ParamIndex.MAX_PITCH_RATE),
+                  int(ParamIndex.MAX_YAW_RATE), int(ParamIndex.MAX_HEADING_RATE)):
+            w = self.params.get(t)
+            if w is not None and isinstance(w, QDoubleSpinBox):
+                tag_values[t] = w.value()
+        caveats = self._cascade_integrity_caveats(tag_values)
+        self._cascade_warnings = caveats
+        if hasattr(self, '_sim_btn') and self._sim_btn:
+            default_text = getattr(self, '_DEFAULT_SIM_BTN_TEXT', "Run Robustness Sim")
+            self._sim_btn.setText(f"Cascade caveats: {len(caveats)}" if caveats else default_text)
+        return caveats
+
+    def _get_scale_factors(self, cat):
+        """Compute per-param scaling factors from physical descriptors.
+
+        Returns {param_idx: scale_factor}. Base curves are for the reference
+        aircraft; scale_factor adjusts for actual aircraft physics.
+
+        MR scaling (direction only — magnitudes are clamped to 0.5–2.0, see
+        the evidence note at the tail of this function):
+          - Rate Kp/Kd: ∝ 1/inertia → lighter/shorter arms → lower inertia → HIGHER gains
+          - Angle Kp/Ki: ∝ mass → heavier → more authority
+          - Rate limits: ∝ 1/mass → lighter → faster response possible
+          - Alt Kp/Ki: NOT scaled — fleet runs 1.83/0.005 flat across 30–1344 g
+            (matches critic-validated .af files; do not add a mass term)
+          - Nav Kp/Ki: ∝ 1/mass → lighter → faster nav response
+
+        FW scaling:
+          - Rate Kp/Kd: ∝ 1/Ixx → larger wingspan → more inertia → LOWER gains
+          - Angle Kp/Ki: ∝ mass → heavier → more authority
+          - Rate limits: ∝ 1/mass → lighter → faster response
+          - Alt Kp/Ki: ∝ mass
+          - Nav Kp/Ki: ∝ 1/cruise_speed → faster cruise → quicker nav
+        """
+        sf = {}
+        try:
+            phys = self._current_phys_meta if hasattr(self, '_current_phys_meta') else {}
+        except AttributeError:
+            phys = {}
+
+        try:
+            auw_g = float(phys.get('PHYS_AUW_G', 0))
+        except (ValueError, TypeError):
+            auw_g = 0
+
+        if auw_g <= 0:
+            return sf
+
+        mass_kg = auw_g / 1000.0
+
+        if cat == 'MR':
+            ref_mass = self._REF_MR_AUW_G / 1000.0
+            try:
+                arm_mm = float(phys.get('PHYS_ARM_MM', self._REF_MR_ARM_MM))
+            except (ValueError, TypeError):
+                arm_mm = self._REF_MR_ARM_MM
+            ref_arm = self._REF_MR_ARM_MM / 1000.0
+            actual_arm = arm_mm / 1000.0
+
+            mass_ratio = mass_kg / ref_mass if ref_mass > 0 else 1.0
+            inertia_ratio = (actual_arm / ref_arm) ** 2 * mass_ratio if ref_arm > 0 else 1.0
+
+            for idx in self._PARAM_CURVES:
+                pname = ''
+                try:
+                    pname = ParamIndex(idx).name
+                except (ValueError, AttributeError):
+                    pass
+
+                if 'RATE_KP' in pname or 'RATE_KD' in pname:
+                    sf[idx] = 1.0 / inertia_ratio if inertia_ratio > 0 else 1.0
+                elif 'ANGLE_Q_KP' in pname or 'ANGLE_Q_KI' in pname or 'ANGLE_Q_INT_LIMIT' in pname:
+                    sf[idx] = mass_ratio
+                elif 'MAX_ROLL_RATE' in pname or 'MAX_PITCH_RATE' in pname or 'MAX_HEADING' in pname:
+                    sf[idx] = 1.0 / mass_ratio if mass_ratio > 0 else 1.0
+
+        elif cat == 'FW':
+            ref_mass = self._REF_FW_AUW_G / 1000.0
+            try:
+                wingspan_mm = float(phys.get('PHYS_WINGSPAN_MM', self._REF_FW_WINGSPAN_MM))
+            except (ValueError, TypeError):
+                wingspan_mm = self._REF_FW_WINGSPAN_MM
+            ref_wingspan = self._REF_FW_WINGSPAN_MM / 1000.0
+            actual_wingspan = wingspan_mm / 1000.0
+
+            mass_ratio = mass_kg / ref_mass if ref_mass > 0 else 1.0
+            inertia_ratio = (actual_wingspan / ref_wingspan) ** 2 * mass_ratio if ref_wingspan > 0 else 1.0
+
+            try:
+                cruise_ms = float(phys.get('PHYS_CRUISE_MS', 12))
+            except (ValueError, TypeError):
+                cruise_ms = 12
+
+            for idx in self._PARAM_CURVES:
+                pname = ''
+                try:
+                    pname = ParamIndex(idx).name
+                except (ValueError, AttributeError):
+                    pass
+
+                if 'RATE_KP' in pname or 'RATE_KD' in pname:
+                    sf[idx] = 1.0 / inertia_ratio if inertia_ratio > 0 else 1.0
+                elif 'ANGLE_Q_KP' in pname or 'ANGLE_Q_KI' in pname or 'ANGLE_Q_INT_LIMIT' in pname:
+                    sf[idx] = mass_ratio
+                elif 'MAX_ROLL_RATE' in pname or 'MAX_PITCH_RATE' in pname or 'MAX_HEADING' in pname:
+                    sf[idx] = 1.0 / mass_ratio if mass_ratio > 0 else 1.0
+
+        # Fleet evidence (Aug 29 audit, wiki/Session_Report_CritiqueRetune_Aug29.md):
+        # the pure ratio model spans 800x across our 30–1344 g fleet, but actual
+        # critic-validated gains span <6x (roll rate gains are nearly flat — thrust
+        # scales with mass, so plant gain is roughly size-invariant). Clamp the
+        # factor so compute_defaults stays near-flyable for extreme frames; the
+        # .af files + critic remain the real per-frame authority.
+        for idx in sf:
+            sf[idx] = min(2.0, max(0.5, sf[idx]))
+        return sf
+
+    def reset_to_computed(self):
+        """Revert all params and slider back to last computed values"""
+        if not self._computed_values:
+            QMessageBox.information(self, "No Computed Values",
+                "Click 'Compute' first to generate values from the slider.")
+            return
+        # Restore slider position
+        if hasattr(self, '_computed_slider_pos') and self._character_slider:
+            self._character_slider.setValue(self._computed_slider_pos)
+        for idx_str, display_val in self._computed_values.items():
+            widget = self.params.get(idx_str)
+            if widget is None:
+                continue
+            widget.blockSignals(True)
+            if isinstance(widget, QDoubleSpinBox):
+                widget.setValue(display_val)
+            widget.blockSignals(False)
+            self.dirty_params.add(idx_str)
+        self.status_label.setText(f"Reset {len(self._computed_values)} params to computed values")
+        self.status_label.setStyleSheet("color: #3498db;")
+        self.update_config_display()
+
+    def run_robustness_sim(self):
+        """Run the robustness simulator for the currently selected airframe.
+
+        Spawns a background thread (the sim is pure-Python) and posts the
+        result back to the UI via QTimer. Uses tests/test_robustness_sim.py.
+        """
+        af_path = getattr(self, '_current_airframe_path', None)
+        if not af_path or not os.path.exists(af_path):
+            af_path = os.path.join(self._generic_dir, 'Quad.af')
+        if not os.path.exists(af_path):
+            QMessageBox.warning(self, "Robustness Sim",
+                f"Airframe file not found:\n{af_path}\n\n"
+                "Run 'Compute' first or load an airframe from the pulldown.")
+            return
+
+        btn = getattr(self, '_sim_btn', None)
+        if btn is not None:
+            btn.setEnabled(False)
+        self._set_sim_button_state('running')
+        self._sim_busy = True
+        self.status_label.setText(f"Running robustness sim for {os.path.basename(af_path)} ...")
+        self.status_label.setStyleSheet("color: #8e44ad;")
+
+        import threading
+
+        def worker():
+            lines = ["<no result>"]
+            all_pass = False
+            try:
+                from tests.test_robustness_sim import quick_check
+                all_pass, lines, _summary = quick_check(af_path, seeds=2)
+            except Exception as e:
+                all_pass = False
+                lines = [f"Simulator error: {e}"]
+            self.sim_finished.emit(all_pass, lines, "", True)
+
+        t = threading.Thread(target=worker, daemon=True)
+        t.start()
+
+    def _on_sim_finished(self, all_pass, lines, summary, manual):
+        self._sim_busy = False
+        self._set_sim_button_state('pass' if all_pass else 'fail')
+        mark = "OK" if all_pass else "FAIL"
+        color = "#27ae60" if all_pass else "#e74c3c"
+        self.status_label.setText(f"Robustness {mark} — {summary}")
+        self.status_label.setStyleSheet(f"color: {color};")
+        if manual:
+            btn = getattr(self, '_sim_btn', None)
+            if btn is not None:
+                btn.setEnabled(True)
+            if not all_pass:
+                msg = ("\n".join(lines)
+                       + "\n\n"
+                       + "❌ SOME CHECKS FAIL")
+                QMessageBox.warning(self, "Robustness Sim Failed", msg)
+
+    def _schedule_sim_check(self):
+        """Debounced auto-trigger of the robustness safety check.
+
+        Fired after Compute and on tuning spinbox edits; re-arms so the sim
+        only runs once the user pauses. Skipped during bulk widget
+        population (FC reads, .af loads) via _suppress_sim_auto.
+        """
+        if not hasattr(self, '_sim_debounce') or self._suppress_sim_auto:
+            return
+        self._sim_debounce.start()
+
+    def _set_sim_button_state(self, state):
+        """Color the Sim button: 'running' orange, 'pass' green, 'fail' red."""
+        if not hasattr(self, '_sim_btn') or self._sim_btn is None:
+            return
+        if state == 'running':
+            self._sim_btn.setStyleSheet(
+                "padding: 2px 6px; font-weight: bold; color: #6b4f00; background-color: #f5c46b;")
+        elif state == 'pass':
+            self._sim_btn.setStyleSheet(
+                "padding: 2px 6px; font-weight: bold; color: white; background-color: #27ae60;")
+        elif state == 'fail':
+            self._sim_btn.setStyleSheet(
+                "padding: 2px 6px; font-weight: bold; color: white; background-color: #e74c3c;")
+        else:
+            self._sim_btn.setStyleSheet(
+                "padding: 2px 6px; font-weight: bold; color: #8e44ad;")
+
+    def _run_auto_sim(self):
+        """Non-intrusive robustness check (debounce timeout).
+
+        Background thread runs quick_check(seeds=1, ~0.6s) and posts a
+        compact PASS/FAIL readout to the status label — no dialog. Deferred
+        (re-armed) while a manual sim is running.
+        """
+        if self._sim_busy:
+            self._sim_debounce.start(300)
+            return
+        af_path = getattr(self, '_current_airframe_path', None)
+        if not af_path or not os.path.exists(af_path):
+            af_path = os.path.join(self._generic_dir, 'Quad.af')
+        if not os.path.exists(af_path):
+            return
+        self._sim_busy = True
+        self._set_sim_button_state('running')
+        self.status_label.setText(f"Robustness check: {os.path.basename(af_path)} ...")
+        self.status_label.setStyleSheet("color: #8e44ad;")
+
+        import threading
+
+        def worker():
+            all_pass, summary = False, "sim error"
+            try:
+                from tests.test_robustness_sim import quick_check
+                all_pass, _lines, summary = quick_check(af_path, seeds=1)
+            except Exception as e:
+                summary = f"sim error: {e}"
+            self.sim_finished.emit(all_pass, [], summary, False)
+
+        t = threading.Thread(target=worker, daemon=True)
+        t.start()
+
+    def _category_for_af(self, af_type):
+        """Return 'MR', 'FW', 'VTOL', 'LAND', or 'NONE' for a given AF type enum value.
+
+        Delegates to the single authority category_of() in protocol_enums.py
+        (mirror of FC ClassifyAFType() in params.c). 'NONE' is a GCS-only
+        refinement for eInstrumentation (sensor pack — drives no motors).
+        """
+        try:
+            from protocol_enums import AirframeType, category_of, AirframeCategory
+            af = AirframeType(af_type)
+            if af is AirframeType.eInstrumentation:
+                return 'NONE'
+            return {
+                AirframeCategory.eCatMr: 'MR',
+                AirframeCategory.eCatFw: 'FW',
+                AirframeCategory.eCatVtol: 'VTOL',
+                AirframeCategory.eCatLand: 'LAND',
+            }[category_of(af)]
+        except (ValueError, AttributeError, KeyError):
+            return 'MR'
+
+    def _compute_physics_from_descriptors(self, phys_meta):
+        """Compute derived quantities from physical descriptors.
+
+        Takes a dict of PHYS_* metadata strings, computes inertias, TWR, etc.
+        Returns a dict of all PHYS_* values (user inputs + computed).
+        Updates the input dict in-place with computed values.
+        """
+        result = dict(phys_meta)
+        try:
+            auw_g = float(result.get('PHYS_AUW_G', 800))
+        except (ValueError, TypeError):
+            auw_g = 800
+        mass_kg = auw_g / 1000.0
+
+        # Determine category from AF type
+        af_combo = self.params.get(int(ParamIndex.AF_TYPE))
+        cat = 'MR'
+        af_type_int = 4
+        if af_combo and isinstance(af_combo, QComboBox):
+            af_data = af_combo.currentData()
+            if af_data is not None:
+                af_type_int = int(af_data)
+                cat = self._category_for_af(af_type_int)
+
+        if cat == 'MR':
+            try:
+                arm_mm = float(result.get('PHYS_ARM_MM', 220))
+            except (ValueError, TypeError):
+                arm_mm = 220
+            arm_m = arm_mm / 1000.0
+            try:
+                prop_in = float(result.get('PHYS_PROP_INCH', 11))
+            except (ValueError, TypeError):
+                prop_in = 11
+            try:
+                thrust_g = float(result.get('PHYS_MOTOR_THRUST_G', 300))
+            except (ValueError, TypeError):
+                thrust_g = 300
+            try:
+                current_a = float(result.get('PHYS_MOTOR_THRUST_A', 20))
+            except (ValueError, TypeError):
+                current_a = 20
+            try:
+                voltage_v = float(result.get('PHYS_MOTOR_THRUST_V', 14.8))
+            except (ValueError, TypeError):
+                voltage_v = 14.8
+            motor_w = current_a * voltage_v
+
+            try:
+                n_motors = int(result.get('PHYS_MOTOR_COUNT', 0))
+            except (ValueError, TypeError):
+                n_motors = 0
+            if n_motors == 0:
+                n_motors = self._MR_MOTOR_COUNT.get(af_type_int, 4)
+            shape_kf = self._MR_SHAPE_KF.get(n_motors, 0.55)
+
+            # Moments of inertia (flat plate approximation)
+            ixx = mass_kg * arm_m * arm_m * shape_kf
+            iyy = ixx
+            izz = ixx * 1.6
+
+            # Direct thrust-based physics
+            thrust_per_motor_n = thrust_g * 9.81 / 1000.0
+            total_thrust_n = thrust_per_motor_n * n_motors
+            twr = total_thrust_n / (mass_kg * 9.81) if mass_kg > 0 else 5.0
+
+            # Hover throttle from thrust fraction (thrust ∝ power^(2/3))
+            thrust_hover_n = (mass_kg * 9.81) / n_motors if n_motors > 0 else mass_kg * 9.81
+            hover_thr = (thrust_hover_n / thrust_per_motor_n) ** 1.5 if thrust_per_motor_n > 0 else 0.5
+
+            result['PHYS_MOTOR_COUNT'] = str(n_motors)
+            result['PHYS_SHAPE_KF'] = f'{shape_kf:.3f}'
+            result['PHYS_IROLL'] = f'{ixx:.6f}'
+            result['PHYS_IPITCH'] = f'{iyy:.6f}'
+            result['PHYS_IYAW'] = f'{izz:.6f}'
+            result['PHYS_MAX_THRUST_N'] = f'{total_thrust_n:.2f}'
+            result['PHYS_TWR'] = f'{twr:.2f}'
+            result['PHYS_HOVER_THR'] = f'{hover_thr:.3f}'
+            result['PHYS_MASS_KG'] = f'{mass_kg:.3f}'
+            result['PHYS_ARM_LEN_M'] = f'{arm_m:.4f}'
+            result['PHYS_PROP_DIAMETER_INCH'] = str(int(prop_in))
+            result['PHYS_MOTOR_THRUST_G'] = str(int(thrust_g))
+            result['PHYS_MOTOR_THRUST_A'] = f'{current_a:.1f}'
+            result['PHYS_MOTOR_THRUST_V'] = f'{voltage_v:.1f}'
+
+        elif cat == 'FW':
+            try:
+                wingspan_mm = float(result.get('PHYS_WINGSPAN_MM', 1800))
+            except (ValueError, TypeError):
+                wingspan_mm = 1800
+            wingspan_m = wingspan_mm / 1000.0
+            try:
+                chord_mm = float(result.get('PHYS_CHORD_MM', 250))
+            except (ValueError, TypeError):
+                chord_mm = 250
+            chord_m = chord_mm / 1000.0
+            try:
+                prop_in = float(result.get('PHYS_PROP_INCH', 10))
+            except (ValueError, TypeError):
+                prop_in = 10
+            try:
+                thrust_g = float(result.get('PHYS_MOTOR_THRUST_G', 800))
+            except (ValueError, TypeError):
+                thrust_g = 800
+            try:
+                current_a = float(result.get('PHYS_MOTOR_THRUST_A', 30))
+            except (ValueError, TypeError):
+                current_a = 30
+            try:
+                voltage_v = float(result.get('PHYS_MOTOR_THRUST_V', 14.8))
+            except (ValueError, TypeError):
+                voltage_v = 14.8
+            motor_w = current_a * voltage_v
+
+            wing_area = wingspan_m * chord_m
+
+            # Moments of inertia (thin plate approximation)
+            ixx = mass_kg * wingspan_m * wingspan_m / 12.0
+            iyy = mass_kg * (wingspan_m * wingspan_m + chord_m * chord_m) / 12.0
+            izz = mass_kg * wingspan_m * wingspan_m / 6.0
+
+            # Cruise speed: V = sqrt(2mg / (rho * S * CL))
+            rho = 1.225
+            cl_cruise = 0.5
+            v_cruise = (2.0 * mass_kg * 9.81 / (rho * wing_area * cl_cruise)) ** 0.5
+
+            # Dynamic pressure at cruise
+            qbar = 0.5 * rho * v_cruise * v_cruise
+
+            # Direct thrust-based physics
+            thrust_n = thrust_g * 9.81 / 1000.0
+
+            result['PHYS_WINGSPAN_M'] = f'{wingspan_m:.4f}'
+            result['PHYS_CHORD_M'] = f'{chord_m:.4f}'
+            result['PHYS_WING_AREA'] = f'{wing_area:.4f}'
+            result['PHYS_IROLL'] = f'{ixx:.6f}'
+            result['PHYS_IPITCH'] = f'{iyy:.6f}'
+            result['PHYS_IYAW'] = f'{izz:.6f}'
+            result['PHYS_CRUISE_MS'] = f'{v_cruise:.1f}'
+            result['PHYS_QBAR'] = f'{qbar:.1f}'
+            result['PHYS_MAX_THRUST_N'] = f'{thrust_n:.2f}'
+            result['PHYS_MASS_KG'] = f'{mass_kg:.3f}'
+            result['PHYS_PROP_DIAMETER_INCH'] = str(int(prop_in))
+            result['PHYS_MOTOR_THRUST_G'] = str(int(thrust_g))
+            result['PHYS_MOTOR_THRUST_A'] = f'{current_a:.1f}'
+            result['PHYS_MOTOR_THRUST_V'] = f'{voltage_v:.1f}'
+
+            # FW cruise power and endurance
+            # Typical drag coefficient for clean airframe
+            cd = 0.04
+            drag_n = qbar * wing_area * cd
+            cruise_power_w = drag_n * v_cruise / 0.30  # η=0.30 (ESC×motor×prop)
+            cruise_thr = cruise_power_w / max(motor_w, 10.0)
+            result['PHYS_CRUISE_POWER_W'] = f'{cruise_power_w:.1f}'
+            result['PHYS_CRUISE_THR'] = f'{cruise_thr:.3f}'
+
+            # Endurance if battery capacity and voltage known
+            try:
+                bat_mah = float(result.get('PHYS_BATTERY_MAH', 0))
+                bat_v = float(result.get('PHYS_BATT_V', 3.7))
+                if bat_mah > 0 and bat_v > 0:
+                    bat_wh = bat_mah * bat_v / 1000.0
+                    endurance_min = bat_wh / cruise_power_w * 60.0
+                    result['PHYS_ENDURANCE_MIN'] = f'{endurance_min:.1f}'
+                    result['PHYS_CRUISE_CURRENT_A'] = f'{cruise_power_w / bat_v:.2f}'
+            except (ValueError, TypeError):
+                pass
+
+        elif cat == 'LAND':
+            try:
+                track_mm = float(result.get('PHYS_TRACK_MM', 300))
+            except (ValueError, TypeError):
+                track_mm = 300
+            track_m = track_mm / 1000.0
+            try:
+                wheel_dia_mm = float(result.get('PHYS_WHEEL_DIA', 100))
+            except (ValueError, TypeError):
+                wheel_dia_mm = 100
+
+            # Simple box inertia for land vehicle
+            ixx = mass_kg * track_m * track_m / 12.0
+            iyy = mass_kg * track_m * track_m / 12.0
+            izz = mass_kg * (track_m * track_m + track_m * track_m) / 12.0
+
+            result['PHYS_TRACK_M'] = f'{track_m:.4f}'
+            result['PHYS_IROLL'] = f'{ixx:.6f}'
+            result['PHYS_IPITCH'] = f'{iyy:.6f}'
+            result['PHYS_IYAW'] = f'{izz:.6f}'
+            result['PHYS_MASS_KG'] = f'{mass_kg:.3f}'
+
+        return result
+
+    def _add_pid_row(self, layout, row, entry):
+        """Add the three axis spins + parameter label for one PID_PARAMS row."""
+        label, roll_idx, pitch_idx, yaw_idx, roll_def, pitch_def, yaw_def = entry
+        self.add_spin(layout, roll_idx, roll_def, row, 0)
+        self.add_spin(layout, pitch_idx, pitch_def, row, 1)
+        self.add_spin(layout, yaw_idx, yaw_def, row, 2)
+        lbl = QLabel(label)
+        lbl.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        layout.addWidget(lbl, row, 3)
+
     def _create_pid_group(self):
-        """Create PID group using enum definitions"""
+        """Create PID group using enum definitions.
+
+        Layout (top to bottom): column labels (Roll/Pitch/Yaw/Parameter) at the very
+        top, then the Max Rate and Max Angle rows (the derivation inputs — always
+        visible/editable), then the View: flick switch, then the gain rows. Two view
+        modes behind the switch:
+        - Angle view (default): every gain/law spin editable (readback/sync/live-write
+          exactly as always).
+        - Rate view: the roll/pitch angle spinboxes (Q Angle, Ki Angle, I-Limit) are
+          hidden and shown as read-only derived labels computed live from the editable
+          MaxRate / MaxAngle spins (QAngleKp = RateMax/(2·sin(AngleMax/2)),
+          KiAngle = k·Kp_angle, I-Limit = 0.01·AngleMax). Yaw stays editable (no yaw
+          angle-max input exists). Derived labels are pure display — the same spins stay
+          in self.params so readback/sync/live-write see both views identically (no
+          widget duplication, per the two-view design, Session_Report_TuningCascade_Sep11).
+        """
         group = QGroupBox("PID (Roll / Pitch / Yaw)")
         group.setStyleSheet("QGroupBox { font-weight: bold; border: 1px solid black; border-radius: 4px; margin-top: 6px; } QGroupBox::title { subcontrol-origin: margin; left: 6px; padding: 0 3px 0 3px; }")
         layout = QGridLayout()
@@ -1292,34 +3383,317 @@ class ParameterWindow(QMainWindow):
         layout.setColumnMinimumWidth(1, 50)
         layout.setColumnMinimumWidth(2, 50)
         layout.setColumnMinimumWidth(3, 85)
-        
+
+        # Column labels at the very top
         layout.addWidget(self._header("Roll"), 0, 0)
         layout.addWidget(self._header("Pitch"), 0, 1)
         layout.addWidget(self._header("Yaw"), 0, 2)
         layout.addWidget(self._header("Parameter"), 0, 3)
-        
-        for row_idx, (label, roll_idx, pitch_idx, yaw_idx, roll_def, pitch_def, yaw_def) in enumerate(self.PID_PARAMS, 1):
-            self.add_spin(layout, roll_idx, roll_def, row_idx, 0)
-            self.add_spin(layout, pitch_idx, pitch_def, row_idx, 1)
-            self.add_spin(layout, yaw_idx, yaw_def, row_idx, 2)
-            lbl = QLabel(label)
-            lbl.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-            layout.addWidget(lbl, row_idx, 3)
-        
-        # Max Angle row
-        row_idx = len(self.PID_PARAMS) + 1
-        self.add_spin(layout, ParamIndex.MAX_ROLL_ANGLE, 60, row_idx, 0)
-        self.add_spin(layout, ParamIndex.MAX_PITCH_ANGLE, 60, row_idx, 1)
+
+        # Derivation-input rows first (always visible/editable, above everything else)
+        pid_rest = [e for e in self.PID_PARAMS if e[0] != "Max Rate (Deg/Sec)"]
+        mr = next(e for e in self.PID_PARAMS if e[0] == "Max Rate (Deg/Sec)")
+        self._add_pid_row(layout, 1, mr)
+        # Max Angle row (yaw: no max-angle input — dash)
+        ma_roll = self.add_spin(layout, ParamIndex.MAX_ROLL_ANGLE, 45, 2, 0)
+        ma_pitch = self.add_spin(layout, ParamIndex.MAX_PITCH_ANGLE, 45, 2, 1)
         dash = QLabel("--")
         dash.setStyleSheet("color: #999;")
         dash.setAlignment(Qt.AlignCenter)
-        layout.addWidget(dash, row_idx, 2)
+        layout.addWidget(dash, 2, 2)
         lbl = QLabel("Max Angle")
         lbl.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-        layout.addWidget(lbl, row_idx, 3)
-        
+        layout.addWidget(lbl, 2, 3)
+
+        # View flick switch (below the derivation-input rows)
+        view_lbl = QLabel("View:")
+        view_lbl.setStyleSheet("font-weight: bold; color: #555;")
+        view_lbl.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        layout.addWidget(view_lbl, 3, 0)
+        self._pid_view_combo = QComboBox()
+        self._pid_view_combo.setObjectName("pidViewCombo")
+        self._pid_view_combo.addItem("Angle (edit)", "angle")
+        self._pid_view_combo.addItem("Rate (derived)", "rate")
+        self._pid_view_combo.setToolTip(
+            "Angle view: tune every gain directly (default).\n"
+            "Rate view: roll/pitch angle spins (Q Angle Kp, Ki Angle, I-Limit) hidden,\n"
+            "shown read-only as values derived from Max Rate / Max Angle; yaw Ki Angle\n"
+            "derived from yaw Q Angle Kp (fleet constant 0.083), yaw Q Angle Kp and\n"
+            "yaw I-Limit stay editable (no yaw angle-max input).\n"
+            "On fixed-wing frames the derived Ki / I-Limit rows are disabled "
+            "(not-applied \u2014 FW angle loop is P-only).")
+        self._pid_view_combo.currentIndexChanged.connect(lambda *_: self._apply_pid_view())
+        layout.addWidget(self._pid_view_combo, 3, 1, 1, 2)
+
+        # Apply-Derived button: materialise the Rate-view derived values into the
+        # real spins (via the normal param_changed path, which stages them as
+        # local edits), after an explicit confirmation. After it succeeds the
+        # page is a normal editable grid (auto-flip to Angle view) and the
+        # Commit button goes RED like any other edit.
+        self._apply_derived_btn = QPushButton("Apply Derived")
+        self._apply_derived_btn.setObjectName("pidApplyDerived")
+        self._apply_derived_btn.setToolTip(
+            "Stage the currently derived values into the real parameter spins "
+            "(one confirmed edit; afterwards the page is a normal editable "
+            "grid \u2014 subsequent edits are staged as usual). Nothing reaches "
+            "the FC until Commit is pressed.\n"
+            "Dormant rows (Ki / I-Limit on fixed-wing frames) are skipped.")
+        self._apply_derived_btn.clicked.connect(self._on_apply_pid_derived)
+        layout.addWidget(self._apply_derived_btn, 3, 3)
+
+        # Gain rows (dependent on the view mode)
+        self._pid_derived = []  # (label, col, derived_label, spin, param_idx) roll/pitch Q-gain rows
+        self._pid_yaw_derived = []  # (label, derived_label, spin, param_idx) yaw Q-gain derived rows (Ki, I-Limit)
+        qgain_row_labels = {"Q Angle", "Ki Angle", "I-Limit"}
+        yaw_kp_spin = None  # the yaw QAngleKp spin (derivation input for yaw Ki)
+        for off, (label, roll_idx, pitch_idx, yaw_idx, roll_def, pitch_def, yaw_def) in enumerate(pid_rest, 4):
+            roll_spin = self.add_spin(layout, roll_idx, roll_def, off, 0)
+            pitch_spin = self.add_spin(layout, pitch_idx, pitch_def, off, 1)
+            yaw_spin = self.add_spin(layout, yaw_idx, yaw_def, off, 2)
+            if label == "Q Angle":
+                yaw_kp_spin = yaw_spin
+            lbl = QLabel(label)
+            lbl.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+            layout.addWidget(lbl, off, 3)
+
+            if label in qgain_row_labels:
+                for col, spin, pidx in ((0, roll_spin, roll_idx), (1, pitch_spin, pitch_idx)):
+                    dlbl = QLabel("")
+                    dlbl.setObjectName("pidDerived")
+                    dlbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                    dlbl.setStyleSheet("color: #2c6fb3; background: transparent;")
+                    dlbl.setMinimumWidth(62)
+                    dlbl.setMaximumWidth(70)
+                    layout.addWidget(dlbl, off, col)
+                    dlbl.hide()
+                    self._pid_derived.append((label, col, dlbl, spin, int(pidx)))
+                # Yaw soaks BOTH angle rows from the fleet: Ki = 0.083·Kp_yaw
+                # (yaw Qa authority ratio constant) and I-Limit = 0.03 (fleet
+                # mode; the yaw heading-hold integral cap, independent of Kp).
+                # No yaw angle-max exists (heading unbounded) so yaw QAngleKp
+                # stays the editable derivation input (the "Q Angle" row).
+                if label in ("Ki Angle", "I-Limit") and yaw_kp_spin is not None:
+                    dlbl = QLabel("")
+                    dlbl.setObjectName("pidDerived")
+                    dlbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                    dlbl.setStyleSheet("color: #2c6fb3; background: transparent;")
+                    dlbl.setMinimumWidth(62)
+                    dlbl.setMaximumWidth(70)
+                    layout.addWidget(dlbl, off, 2)
+                    dlbl.hide()
+                    self._pid_yaw_derived.append((label, dlbl, yaw_spin, int(yaw_idx)))
+                    if label == "Ki Angle":
+                        yaw_kp_spin.valueChanged.connect(self._refresh_pid_derived)
+
         group.setLayout(layout)
+
+        # Derived labels track the editable Max Angle / Max Rate spins live
+        # (these are the derivation inputs, and they drive both views).
+        for idx in (ParamIndex.MAX_ROLL_RATE, ParamIndex.MAX_PITCH_RATE,
+                    ParamIndex.MAX_ROLL_ANGLE, ParamIndex.MAX_PITCH_ANGLE):
+            spin = self.params.get(int(idx))
+            if isinstance(spin, QDoubleSpinBox):
+                spin.valueChanged.connect(self._refresh_pid_derived)
+
+        self._apply_pid_view()
         return group
+
+    def _current_af_category(self) -> str:
+        """Current airframe category ('MR', 'FW', 'VTOL', 'LAND', 'NONE'),
+        mirroring FC ClassifyAFType(). Falls back to 'MR' (the default)."""
+        combo = None
+        if hasattr(self, "_setup_widgets"):
+            combo = self._setup_widgets.get(int(ParamIndex.AF_TYPE))
+        if not isinstance(combo, QComboBox):
+            combo = self.params.get(int(ParamIndex.AF_TYPE))
+        if isinstance(combo, QComboBox):
+            data = combo.currentData()
+            if data is not None:
+                try:
+                    return self._category_for_af(int(data))
+                except (ValueError, TypeError):
+                    pass
+        return 'MR'
+
+    def _apply_pid_view(self):
+        """Apply the flick-switch view mode to the PID grid.
+
+        Angle view: derived labels hidden, Q-gain spins visible (editable).
+        Rate view: roll/pitch Q-gain spins hidden, derived labels shown. Yaw Ki Angle
+        and Yaw I-Limit are derived from the fleet (0.083·Kp_yaw and 0.03) from the
+        editable yaw QAngleKp spin — still visible as the derivation input (no yaw
+        angle-max exists). FW frames: derived Ki / I-Limit rows disabled
+        (not-applied — FW angle loop is P-only, dormant Ki).
+        """
+        rate = False
+        combo = getattr(self, "_pid_view_combo", None)
+        if isinstance(combo, QComboBox):
+            rate = combo.currentData() == "rate"
+        self._pid_view_is_rate = rate
+        cat = self._current_af_category()
+
+        self._refresh_pid_derived()
+
+        for label, _col, dlbl, spin, _idx in getattr(self, "_pid_derived", []):
+            if not rate:
+                dlbl.hide()
+                spin.show()
+                continue
+            spin.hide()
+            dlbl.show()
+            if label in ("Ki Angle", "I-Limit") and cat == 'FW':
+                dlbl.setEnabled(False)
+                dlbl.setToolTip("Not applied on the FW angle loop (P-only \u2014 dormant Ki).")
+            else:
+                dlbl.setEnabled(True)
+                dlbl.setToolTip("Derived in Rate view from Max Angle / Max Rate.")
+
+        for label, dlbl, spin, _idx in getattr(self, "_pid_yaw_derived", []):
+            if not rate:
+                dlbl.hide()
+                spin.show()
+                continue
+            spin.hide()
+            dlbl.show()
+            if cat == 'FW':
+                dlbl.setEnabled(False)
+                dlbl.setToolTip("Not applied on the FW angle loop (P-only \u2014 dormant Ki).")
+            else:
+                dlbl.setEnabled(True)
+                if label == "Ki Angle":
+                    dlbl.setToolTip("Yaw angle Ki derived from the fleet (0.083 \u00b7 yaw QAngleKp).")
+                else:
+                    dlbl.setToolTip("Yaw I-Limit derived from the fleet (0.03 \u2014 yaw heading-hold integral cap).")
+
+    def _refresh_pid_derived(self):
+        """Recompute the Rate-view derived labels from the editable Max Angle / Max
+        Rate spins (display deg / deg/s converted to rad / rad/s), in the same display
+        units as the spins they replace: QAngleKp = RateMax/(2·sin(AngleMax/2)),
+        KiAngle = k·Kp_angle (MR/VTOL 0.026, FW 0.05), I-Limit = 0.01·AngleMax.
+        Yaw: Ki = 0.083·Kp_yaw and I-Limit = 0.03 (fleet constants), both from the
+        editable yaw QAngleKp spin. Values are also cached in `_pid_derived_last`
+        ({param_idx: display_value}) so the Apply-Derived button can materialise
+        exactly what the labels show.
+        """
+        derived = getattr(self, "_pid_derived", None)
+        yaw_derived = getattr(self, "_pid_yaw_derived", None)
+        if not derived and not yaw_derived:
+            return
+
+        self._pid_derived_last = {}
+
+        def spin_val(pidx):
+            w = self.params.get(int(pidx))
+            return w.value() if isinstance(w, QDoubleSpinBox) else 0.0
+
+        deg2rad = math.pi / 180.0
+        cat = self._current_af_category()
+        k = 0.026 if cat != 'FW' else 0.05
+
+        for label, col, dlbl, _spin, pidx in derived:
+            if col == 0:
+                rmax = spin_val(ParamIndex.MAX_ROLL_RATE) * deg2rad
+                amax = spin_val(ParamIndex.MAX_ROLL_ANGLE) * deg2rad
+            else:
+                rmax = spin_val(ParamIndex.MAX_PITCH_RATE) * deg2rad
+                amax = spin_val(ParamIndex.MAX_PITCH_ANGLE) * deg2rad
+            if amax <= 1e-9:
+                dlbl.setText("")
+                continue
+            denom = 2.0 * math.sin(amax * 0.5)
+            if label == "Q Angle":
+                val = (rmax / denom) if denom > 1e-12 else 0.0
+            elif label == "Ki Angle":
+                qkp = (rmax / denom) if denom > 1e-12 else 0.0
+                val = k * qkp
+            else:  # I-Limit
+                val = 0.01 * amax
+            dlbl.setText(f"{val:.4f}")
+            self._pid_derived_last[int(pidx)] = val
+
+        yaw_kp = spin_val(ParamIndex.YAW_ANGLE_Q_KP)
+        for label, dlbl, _spin, pidx in yaw_derived:
+            if label == "Ki Angle":
+                val = self._YAW_ANGLE_KI_KP_RATIO * yaw_kp
+            else:  # I-Limit — fleet mode, independent of Kp
+                val = 0.03
+            dlbl.setText(f"{val:.4f}")
+            self._pid_derived_last[int(pidx)] = val
+
+    def _on_apply_pid_derived(self):
+        """Apply-Derived button: materialise the currently derived values into the
+        real parameter spins, after an explicit confirmation.
+
+        The spin setValue calls fire the normal valueChanged -> param_changed
+        path, which stages the derived values as local edits (and marks the
+        Commit button pending). No confirmation is shown for subsequent edits —
+        after Apply the page is a normal editable grid. Dormant rows (FW
+        Ki/I-Limit, and all yaw angle rows on FW) are skipped.
+        """
+        derived = getattr(self, "_pid_derived", [])
+        yaw_derived = getattr(self, "_pid_yaw_derived", [])
+        last = getattr(self, "_pid_derived_last", {})
+        if not last:
+            self._refresh_pid_derived()
+            last = getattr(self, "_pid_derived_last", {})
+
+        cat = self._current_af_category()
+        fw = cat == 'FW'
+
+        changes = []  # (axis, label, param_idx, spin, old_display, new_display)
+        for label, col, dlbl, spin, pidx in derived:
+            if fw and label in ("Ki Angle", "I-Limit"):
+                continue  # dormant on the FW angle loop
+            idx = int(pidx)
+            if idx not in last:
+                continue
+            new_d = last[idx]
+            old_d = spin.value() if isinstance(spin, QDoubleSpinBox) else 0.0
+            if abs(new_d - old_d) < 1e-9:
+                continue  # already equal — nothing to write
+            axis = "Roll" if col == 0 else "Pitch"
+            changes.append((axis, label, idx, spin, old_d, new_d))
+
+        for label, dlbl, spin, pidx in yaw_derived:
+            if fw:
+                continue  # yaw angle rows dormant on FW (aMax = eRoll)
+            idx = int(pidx)
+            if idx not in last:
+                continue
+            new_d = last[idx]
+            old_d = spin.value() if isinstance(spin, QDoubleSpinBox) else 0.0
+            if abs(new_d - old_d) < 1e-9:
+                continue
+            changes.append(("Yaw", label, idx, spin, old_d, new_d))
+
+        if not changes:
+            QMessageBox.information(self, "Apply Derived",
+                                    "Derived values already match the current "
+                                    "settings \u2014 nothing to write.")
+            return
+
+        lines = ["Overwrite these angle gains in the FC (one confirmed write)?\n"]
+        for axis, label, _idx, _spin, old_d, new_d in changes:
+            lines.append(f"  {axis} {label}: {old_d:.4f} \u2192 {new_d:.4f}")
+        lines.append("")
+        lines.append("After applying, the page returns to normal editing \u2014 "
+                     "subsequent changes are live-written without confirmation.")
+
+        reply = QMessageBox.question(
+            self, "Apply Derived", "\n".join(lines),
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+
+        for _axis, _label, idx, spin, _old_d, new_d in changes:
+            if isinstance(spin, QDoubleSpinBox):
+                spin.setValue(new_d)
+
+        combo = getattr(self, "_pid_view_combo", None)
+        if isinstance(combo, QComboBox) and combo.currentData() != "angle":
+            combo.setCurrentIndex(combo.findData("angle"))
+
+        self._refresh_pid_derived()
 
     def _create_fixed_wing_group(self):
         group = QGroupBox("Fixed Wing")
@@ -1392,6 +3766,130 @@ class ParameterWindow(QMainWindow):
         group.setLayout(layout)
         return group
 
+    def _create_fixed_wing_two_col_box(self):
+        # Group FF parameters together in left column, others in right
+        ff_params = []
+        other_params = []
+        for p in self.FW_PARAMS:
+            name = p[1]
+            if "FF" in name or "Mix" in name or "Diff" in name or "Spoiler" in name or "Decay" in name:
+                ff_params.append(p)
+            else:
+                other_params.append(p)
+
+        group = QGroupBox("Fixed Wing")
+        group.setStyleSheet("QGroupBox { font-weight: bold; border: 1px solid black; border-radius: 4px; margin-top: 6px; } QGroupBox::title { subcontrol-origin: margin; left: 6px; padding: 0 3px 0 3px; }")
+        layout = QGridLayout()
+        layout.setHorizontalSpacing(2)      # Match Altitude
+        layout.setVerticalSpacing(1)
+        layout.setContentsMargins(4, 8, 4, 4)  # Match Altitude
+        layout.setColumnMinimumWidth(0, 50)
+        layout.setColumnMinimumWidth(2, 50)
+
+        # Left column: FF params
+        for i, (idx, name, default) in enumerate(ff_params):
+            self.add_spin(layout, idx, default, i, 0)
+            lbl = QLabel(name)
+            lbl.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+            layout.addWidget(lbl, i, 1)
+
+        # Right column: other params
+        for i, (idx, name, default) in enumerate(other_params):
+            self.add_spin(layout, idx, default, i, 2)
+            lbl = QLabel(name)
+            lbl.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+            layout.addWidget(lbl, i, 3)
+
+        # Servo Sense — FC pServoSense bitmask (tag 51), surfaced as labelled
+        # checkboxes instead of a raw 0-127 number.  InitServoSense() maps each
+        # bit to one servo output via SM[] = {RightAileronC, LeftAileronC,
+        # ElevatorC, RudderC, SpoilerC, CamRollC, Aux1CamPitchC}: bit SET =
+        # reversed sense (PWSense = -1.0), bit clear = normal (+1.0).  Now
+        # recomputed immediately on a live tag-17 write (telem.c
+        # ProcessParamsWrite), so no boot/commit is needed to take effect.
+        ss_row = max(len(ff_params), len(other_params)) + 1
+        ss_title = QLabel("Servo Sense")
+        ss_title.setStyleSheet("font-weight: bold;")
+        layout.addWidget(ss_title, ss_row, 0, 1, 4)
+
+        self.servo_sense_checks = []
+        servo_sense_bits = [
+            ("Right Aileron", 0), ("Left Aileron", 1), ("Elevator", 2),
+            ("Rudder", 3), ("Spoiler", 4), ("Cam Roll", 5), ("Cam Pitch", 6),
+        ]
+        for i, (name, bit) in enumerate(servo_sense_bits):
+            cb = QCheckBox(name)
+            cb.setProperty("bit", bit)
+            cb.setToolTip("Reverses this servo output's sense on the FC.\n"
+                          "Checked = bit SET = reversed (PWSense = -1).\n"
+                          "Applies immediately (live param write).")
+            cb.stateChanged.connect(lambda s, b=bit: self.servo_sense_bit_changed(b, s))
+            layout.addWidget(cb, ss_row + 1 + i // 2, (i % 2) * 2, 1, 2)
+            self.servo_sense_checks.append(cb)
+
+        self._fw_group = group
+
+        group.setLayout(layout)
+        return group
+
+    def _create_filters_single_box(self):
+        group = QGroupBox("Filters")
+        group.setStyleSheet("QGroupBox { font-weight: bold; border: 1px solid black; border-radius: 4px; margin-top: 6px; } QGroupBox::title { subcontrol-origin: margin; left: 6px; padding: 0 3px 0 3px; }")
+        layout = QGridLayout()
+        layout.setHorizontalSpacing(2)
+        layout.setVerticalSpacing(1)
+        layout.setContentsMargins(4, 8, 4, 4)
+        layout.setColumnMinimumWidth(0, 50)
+        layout.setColumnMinimumWidth(1, 80)
+
+        for i, param in enumerate(self.FILTER_PARAMS, 1):
+            if len(param) == 4:
+                idx, name, default, items = param
+                self.add_combo(layout, name, idx, default, items, i)
+            else:
+                idx, name, default = param
+                self.add_spin(layout, idx, default, i, 0)
+                lbl = QLabel(name)
+                lbl.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+                layout.addWidget(lbl, i, 1)
+
+        group.setLayout(layout)
+        return group
+
+    def _create_filters_two_col_box(self):
+        # Split FILTER_PARAMS into two columns
+        mid = len(self.FILTER_PARAMS) // 2 + len(self.FILTER_PARAMS) % 2
+        left_params = self.FILTER_PARAMS[:mid]
+        right_params = self.FILTER_PARAMS[mid:]
+
+        group = QGroupBox("Filters")
+        group.setStyleSheet("QGroupBox { font-weight: bold; border: 1px solid black; border-radius: 4px; margin-top: 6px; } QGroupBox::title { subcontrol-origin: margin; left: 6px; padding: 0 3px 0 3px; }")
+        layout = QGridLayout()
+        layout.setHorizontalSpacing(20)
+        layout.setVerticalSpacing(1)
+        layout.setContentsMargins(8, 8, 8, 8)
+
+        # Left column
+        for i, param in enumerate(left_params):
+            if len(param) == 4:
+                idx, name, default, items = param
+                self.add_combo(layout, name, idx, default, items, i, 0)
+            else:
+                idx, name, default = param
+                self.add_spin_label(layout, name, idx, default, i, 0)
+
+        # Right column
+        for i, param in enumerate(right_params):
+            if len(param) == 4:
+                idx, name, default, items = param
+                self.add_combo(layout, name, idx, default, items, i, 2)
+            else:
+                idx, name, default = param
+                self.add_spin_label(layout, name, idx, default, i, 2)
+
+        group.setLayout(layout)
+        return group
+
     def _create_estimator_group(self):
         group = QGroupBox("Estimator")
         group.setStyleSheet("QGroupBox { font-weight: bold; border: 1px solid black; border-radius: 4px; margin-top: 6px; } QGroupBox::title { subcontrol-origin: margin; left: 6px; padding: 0 3px 0 3px; }")
@@ -1416,26 +3914,49 @@ class ParameterWindow(QMainWindow):
 
         self.config1_checks = []
         config1_bits = [
-            ("Ext Mag", 0), ("Autoland", 1), ("No LEDs", 2),
-            ("Emulation", 3), ("AH Alarm", 4), ("GPS Alt", 5), ("Disable VRS", 6),
-            ("Clamp", 7),
+            ("Ext Mag", 0), ("Autoland", 1), ("Use Mag", 2),
+            ("Emulation", 3, True, "Emulation disabled — commissioning is real flight only."),
+            ("AH Alarm", 4), ("GPS Alt", 5),
+            ("Unused 1-6", 6, True), ("Clamp", 7),
         ]
-        for i, (name, bit) in enumerate(config1_bits):
+        for i, item in enumerate(config1_bits):
+            name, bit = item[0], item[1]
+            unused = len(item) > 2 and item[2]
+            tip = item[3] if len(item) > 3 else None
             cb = QCheckBox(name)
             cb.setProperty("bit", bit)
             cb.stateChanged.connect(lambda s, b=bit: self.bit_changed(ParamIndex.CONFIG1_BITS, b, s))
+            if unused:
+                cb.setEnabled(False)
+                cb.setToolTip(tip if tip else "Unused — free config bit (Config1 bit 6). Emulation now implies the 4-WP test mission.")
             layout.addWidget(cb, i // 2, (i % 2) + 1)
             self.config1_checks.append(cb)
 
         self.config2_checks = []
         config2_bits = [
-            ("Batt Comp", 0), ("Fast Start", 1), ("BLHeli", 2),
-            ("Glider", 3), ("Rev Props", 4), ("Turn WP", 5), ("Beep WP", 6),
+            ("Batt Comp", 0), ("Unused 2-1", 1, True), ("Unused 2-2", 2, True),
+            ("Have GPS", 3), ("Prop In", 4), ("Turn WP", 5), ("Beep WP", 6),
+            ("Unused 2-7", 7, True),
         ]
-        for i, (name, bit) in enumerate(config2_bits):
+        for i, item in enumerate(config2_bits):
+            name, bit = item[0], item[1]
+            unused = len(item) > 2 and item[2]
             cb = QCheckBox(name)
             cb.setProperty("bit", bit)
             cb.stateChanged.connect(lambda s, b=bit: self.bit_changed(ParamIndex.CONFIG2_BITS, b, s))
+            if name == "Have GPS":
+                cb.setToolTip("Sets/clears FC HaveGPS (drives InitialisingGPS / no-GPS boot):\n"
+                              "bit SET = GPS required (waits for a fix),\n"
+                              "bit CLEAR = no GPS - FC skips InitialisingGPS and flies without a satellite fix")
+            elif bit == 1:
+                cb.setEnabled(False)
+                cb.setToolTip("Unused — free config bit (Config2 bit 1), was Fast Start.\n"
+                              "FastStart only skipped the gyro grab; the grab now always runs "
+                              "and falls back on the stored bias, and a never-calibrated FC is "
+                              "blocked from arming by the FC instead.")
+            elif unused:
+                cb.setEnabled(False)
+                cb.setToolTip(f"Unused — free config bit (Config2 bit {bit}). Available for a future feature.")
             layout.addWidget(cb, i // 2 + 4, (i % 2) + 1)
             self.config2_checks.append(cb)
 
@@ -1496,11 +4017,30 @@ class ParameterWindow(QMainWindow):
         group.setLayout(layout)
         return group
 
+    def _add_altitude_readout(self, group):
+        """Append the display-only live Cruise Throttle readout to the Altitude box."""
+        layout = group.layout()
+        if not isinstance(layout, QGridLayout):
+            return
+        row = (len(self.ALTITUDE_PARAMS) + 1) // 2 + 1
+        self._cruise_thr_label = QLabel("--%")
+        self._cruise_thr_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self._cruise_thr_label.setMinimumWidth(62)
+        self._cruise_thr_label.setMaximumWidth(70)
+        self._cruise_thr_label.setStyleSheet(
+            "color: #555; font-weight: bold; padding: 1px 2px;")
+        self._cruise_thr_label.setToolTip(
+            "Cruise throttle feed-forward the FC tracks in flight (read-only)")
+        name = QLabel("Cruise Thr (tracked)")
+        name.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        layout.addWidget(self._cruise_thr_label, row, 0)
+        layout.addWidget(name, row, 1, 1, 3)
+
     def add_spin(self, layout, idx: ParamIndex, default: float, row: int, col: int):
         """Always a QDoubleSpinBox. Step = range/50."""
         idx_int = int(idx)
         mult = self._display_mult(idx_int)
-        limits = PARAM_LIMITS.get(idx_int, (0.0, 255.0))
+        limits = self._param_limits(idx_int)
 
         lo = limits[0] * mult
         hi = limits[1] * mult
@@ -1508,7 +4048,7 @@ class ParameterWindow(QMainWindow):
         step = max(0.001, span / 50.0)
         if mult == 100:
             step = 1.0
-        if idx_int in (68, 113) and step < 1.0:
+        if idx_int in (68,) and step < 1.0:
             step = 1.0
         dec = max(0, min(6, -int(math.floor(math.log10(step)))))
         if mult not in (1.0, 100.0) and dec == 0 and step > 0.1:
@@ -1519,14 +4059,18 @@ class ParameterWindow(QMainWindow):
         if idx_int in (84, 85) and step > 0.01:
             step = 0.01
             dec = 2
-        # Defaults in the param lists are in legacy display units (old
-        # uint8-style integers).  Convert through raw for legacy-tagged
-        # params so the spinbox shows the correct scaled value.
-        if idx_int in LEGACY_TAGS:
-            scale = PARAM_SCALES.get(idx_int, 1.0)
-            val = float(default) * scale * mult
-        else:
-            val = float(default)
+        if idx_int in ONE_DECIMAL_LIMIT_TAGS:
+            step = 0.1
+            dec = 1
+        dec = self._min_decimals(idx_int, dec)
+        # Built-in default is expressed in unified (normal) display units;
+        # project it through the classic scaling so the initial value matches
+        # this box's (possibly legacy-scaled) range.  Untagged params are
+        # unaffected (mult == norm_mult), and normal mode has mult ==
+        # PARAM_DISPLAY_MULT == norm_mult, so val stays the raw default.
+        norm_mult = PARAM_DISPLAY_MULT.get(idx_int, 1.0)
+        val = (float(default) * (mult / norm_mult)
+               if norm_mult else float(default))
 
         spin = QDoubleSpinBox()
         spin.setRange(lo, hi)
@@ -1598,7 +4142,7 @@ class ParameterWindow(QMainWindow):
         combo.setCurrentIndex(default_idx)
         combo.setProperty("param_index", int(idx))
         combo.installEventFilter(self)
-        combo.currentIndexChanged.connect(lambda v, i=int(idx): self.combo_changed(i, v))
+        combo.currentIndexChanged.connect(lambda v, i=int(idx): self.combo_changed(i))
         combo.setToolTip(f"Parameter {int(idx)+1}: {idx.name}")
         combo.setMaximumWidth(100)
         combo.setEditable(True)
@@ -1617,6 +4161,18 @@ class ParameterWindow(QMainWindow):
         self.params[int(idx)] = combo
         return combo
     
+    def config_bits(self, idx) -> Optional[int]:
+        """Current value of a config-bitmask parameter, or None if unknown.
+
+        Other windows need this to mirror FC gate conditions that depend on
+        config bits - e.g. the calibration window must know whether UseMag is
+        set before it can say an uncalibrated mag "blocks arming", because the
+        FC's CalibrationSufficient() only demands it when MagInUse() holds.
+        Returns None rather than 0 when the value has not been read back yet,
+        so a caller can tell "not known" from "known to be clear".
+        """
+        return self._config_values.get(int(idx))
+
     def bit_changed(self, idx: ParamIndex, bit: int, state: int):
         """Handle configuration bit checkbox changes"""
         current = self._config_values.get(int(idx), 0)
@@ -1628,17 +4184,75 @@ class ParameterWindow(QMainWindow):
         new_value = max(0, min(255, new_value))
         self._config_values[int(idx)] = new_value
         
-        # Sync the hidden widget so write_params/send_params use the corrected value
+        # Sync the hidden widget so the block-image builder uses the corrected
+        # value. blockSignals: the spinbox's valueChanged is already wired to
+        # param_changed, which is then called explicitly below — an unblocked
+        # setValue would run param_changed twice per config bit toggle.
         pi = int(idx)
         if pi in self.params and isinstance(self.params[pi], QDoubleSpinBox):
+            self.params[pi].blockSignals(True)
             self.params[pi].setValue(new_value)
+            self.params[pi].blockSignals(False)
             self._log(f"  🔧 Config bit toggled: Param[{pi}] = {current} → {new_value} (synced)")
         else:
             self._log(f"  ⚠️ Config bit toggled: Param[{pi}] = {current} → {new_value} (widget NOT FOUND)")
         
         self.param_changed(pi, new_value)
         self.update_config_display()
-    
+
+    def servo_sense_bit_changed(self, bit: int, state: int):
+        """Handle Servo Sense (tag 51) checkbox changes.
+
+        Checked = bit SET = that servo output is reversed (PWSense = -1).
+        Mirror of bit_changed but reads the current bitmask from the
+        spinbox backing the param, since SERVO_SENSE has no config-register
+        cache.  The spinbox's valueChanged -> param_changed connection
+        (hidden spinbox wiring) handles dirty-marking, the protected-param
+        confirm dialog and the write queue, so we only push the new bitmask
+        into the spinbox here.
+        """
+        pi = int(ParamIndex.SERVO_SENSE)
+        spin = self.params.get(pi)
+        if not isinstance(spin, QDoubleSpinBox):
+            self._log(f"  ⚠️ Servo Sense widget NOT FOUND — cannot toggle bit {bit}")
+            return
+
+        current = int(round(spin.value()))
+        if state == Qt.Checked:
+            new_value = current | (1 << bit)
+        else:
+            new_value = current & ~(1 << bit)
+
+        new_value = max(0, min(127, new_value))
+        spin.setValue(new_value)
+        self._log(f"  🔧 Servo Sense bit{bit} toggled: 0b{current:07b} → 0b{new_value:07b} (Param[{pi}] = {new_value})")
+        # Re-sync the checkboxes from the spinbox: on an accepted change the
+        # valueChanged->param_changed->update_config_display chain already did
+        # this, but if the protected-param confirm is declined param_changed
+        # reverts the spinbox and returns before its update call — so the
+        # checkboxes must be re-read here to stay consistent.
+        self.update_config_display()
+
+    def _rc_channel_changed(self, idx_int, fn_idx, value):
+        """Handle RC channel spin box change — mark param dirty + check for clashes"""
+        self.dirty_params.add(idx_int)
+        self.status_label.setText(f"P{idx_int+1} changed ({len(self.dirty_params)})")
+        self.status_label.setStyleSheet("color: #f39c12;")
+        self._mark_dirty()
+
+        # Channel 0 is a legal channel and throttle's default, so there is no
+        # "zero means unset" early-out here - that skip was the one case most
+        # likely to be duplicated, and it went unreported.
+        dups = self._rc_duplicate_map()
+        if value in dups:
+            names = dups[value]
+            QMessageBox.warning(
+                self, "Channel Clash",
+                f"Channel {value} is assigned to: {', '.join(names)}\n\n"
+                "Every function must have its own channel. The FC refuses a "
+                "map with a duplicate (F.RCMapFail) and will not arm under it."
+            )
+
     def update_config_display(self):
         """Update config value displays and checkboxes"""
         val1 = self._config_values.get(ParamIndex.CONFIG1_BITS, 0)
@@ -1655,7 +4269,18 @@ class ParameterWindow(QMainWindow):
             cb.blockSignals(True)
             cb.setChecked((val2 & (1 << bit)) != 0)
             cb.blockSignals(False)
-    
+
+        # Servo Sense (tag 51) is a bitmask surfacing as labelled checkboxes in
+        # the Fixed Wing pgroup.  Sync from the spinbox holding the raw value.
+        ss_spin = self.params.get(int(ParamIndex.SERVO_SENSE))
+        if ss_spin is not None and isinstance(ss_spin, QDoubleSpinBox):
+            val_ss = int(round(ss_spin.value()))
+            for cb in self.servo_sense_checks:
+                bit = cb.property("bit")
+                cb.blockSignals(True)
+                cb.setChecked((val_ss & (1 << bit)) != 0)
+                cb.blockSignals(False)
+
     def reset_config(self):
         """Reset both config registers to 0"""
         for idx in (ParamIndex.CONFIG1_BITS, ParamIndex.CONFIG2_BITS):
@@ -1666,117 +4291,318 @@ class ParameterWindow(QMainWindow):
             self.param_changed(idx, 0)
         self._log("  🔧 Config reset: both Config1 and Config2 set to 0 (synced to spinbox)")
         self.update_config_display()
-    
+
+    def param_widget(self, idx):
+        """Return the authoritative widget for a parameter index, or None.
+
+        The Setup group registers its widgets into _setup_widgets, NOT into
+        self.params, so a few parameters exist only there (AF_TYPE,
+        AS_SENSOR_TYPE, BATTERY_CAPACITY, CURRENT_SCALE, VOLT_SCALE). The
+        Advanced page duplicates some Setup parameters in both dicts and keeps
+        them in sync (_sync_setup_to_advanced / sync_setup_from_advanced);
+        for those self.params stays authoritative, so nothing changes. The
+        fallback is what stops the bulk collectors from silently dropping a
+        setup-only parameter on read, and from writing/saving it as 0.0.
+        """
+        widget = self.params.get(idx)
+        if widget is None:
+            widget = getattr(self, "_setup_widgets", {}).get(idx)
+        return widget
+
     def _raw_float_values(self) -> List[float]:
         """Collect current widget values as raw float32 values (already scaled)."""
         vals = []
         for i in range(self.MAX_PARAMS):
-            if i in self.params:
-                widget = self.params[i]
+            widget = self.param_widget(i)
+            if widget is not None:
                 if isinstance(widget, QDoubleSpinBox):
                     mult = self._display_mult(i)
                     vals.append(widget.value() / mult)
                 elif isinstance(widget, QComboBox):
                     data = widget.itemData(widget.currentIndex())
-                    vals.append(float(data) if data is not None else float(widget.currentIndex()))
+                    if data is None:
+                        raise ValueError(
+                            f"Combo param {i} selection has no data "
+                            f"(index {widget.currentIndex()}) — refusing to save "
+                            f"a positional index as the value")
+                    vals.append(float(data))
+                elif isinstance(widget, QSpinBox):
+                    vals.append(float(widget.value()))
                 else:
                     vals.append(0.0)
             else:
                 vals.append(0.0)
         return vals
 
+    def build_raw_image(self) -> List[float]:
+        """Return the complete 128-value raw float image for a tag-77 block write.
+
+        Widget values are authoritative where a widget exists. Parameters the GCS
+        has no widget for take their value from the last full tag-71 readback
+        (`_fc_readback_float`), so a block write can never zero a parameter the
+        GCS does not manage. Only a value with no widget AND no readback falls
+        back to 0.0, and that is logged elsewhere as a skip in the tag-17 path.
+        """
+        image = []
+        for i in range(self.MAX_PARAMS):
+            # POWER_RESET_CAUSE is FC-written at boot (the live reset reason);
+            # the airframe's copy is stale by definition. Keep the FC's own
+            # value so a commit persists the real cause, never the file's 0.
+            if i == int(ParamIndex.POWER_RESET_CAUSE):
+                image.append(float(self._fc_readback_float.get(i, 0.0)))
+                continue
+            widget = self.param_widget(i)
+            if isinstance(widget, QDoubleSpinBox):
+                image.append(widget.value() / self._display_mult(i))
+            elif isinstance(widget, QSpinBox):
+                image.append(float(widget.value()))
+            elif isinstance(widget, QComboBox):
+                data = widget.currentData()
+                if data is None:
+                    raise ValueError(
+                        f"Combo param {i} selection has no data "
+                        f"(index={widget.currentIndex()}) — refusing to send "
+                        f"a positional index as the value")
+                image.append(float(data))
+            elif i in self._fc_readback_float:
+                image.append(float(self._fc_readback_float[i]))
+            else:
+                image.append(0.0)
+        return image
+
+    def _apply_airframe_limits(self):
+        """Re-apply spinbox ranges from the current .af [LIMITS] block (raw
+        limits × display mult), falling back to the class-ceiling PARAM_LIMITS
+        for tags without a [LIMITS] entry. If a loaded value already sits
+        outside the new range the bound is widened to contain it, never the
+        value silently clamped (setRange would otherwise inflate/deflate a
+        stale .af gain into the range — the Shadow 'way too high' trap).
+        """
+        for idx, widget in self.params.items():
+            if not isinstance(widget, QDoubleSpinBox):
+                continue
+            idx_int = int(idx)
+            mult = self._display_mult(idx_int)
+            lo_r, hi_r = self._param_limits(idx_int)
+            lo = lo_r * mult
+            hi = hi_r * mult
+            span = hi - lo
+            step = max(0.001, span / 50.0)
+            if mult == 100:
+                step = 1.0
+            if idx_int in (68,) and step < 1.0:
+                step = 1.0
+            dec = max(0, min(6, -int(math.floor(math.log10(step)))))
+            if mult not in (1.0, 100.0) and dec == 0 and step > 0.1:
+                step = 0.1
+                dec = 1
+            if idx_int == 91 and step > 0.5:
+                step = 0.5
+            if idx_int in (84, 85) and step > 0.01:
+                step = 0.01
+                dec = 2
+            dec = self._min_decimals(idx_int, dec)
+            current = widget.value()
+            if current < lo:
+                lo = current
+            elif current > hi:
+                hi = current
+            span = hi - lo
+            step = max(0.001, span / 50.0)
+            if mult == 100:
+                step = 1.0
+            if idx_int in (68,) and step < 1.0:
+                step = 1.0
+            dec = max(0, min(6, -int(math.floor(math.log10(step)))))
+            if mult not in (1.0, 100.0) and dec == 0 and step > 0.1:
+                step = 0.1
+                dec = 1
+            if idx_int == 91 and step > 0.5:
+                step = 0.5
+            if idx_int in (84, 85) and step > 0.01:
+                step = 0.01
+                dec = 2
+            dec = self._min_decimals(idx_int, dec)
+            widget.blockSignals(True)
+            widget.setRange(lo, hi)
+            widget.setDecimals(dec)
+            widget.setSingleStep(step)
+            widget.blockSignals(False)
+
     def _set_widgets_from_raw(self, raw_values: Dict[int, float]):
         """Set all UI widget values from raw float32 dictionary {idx: raw_float}."""
-        for i, raw in raw_values.items():
-            if i not in self.params:
-                continue
-            widget = self.params[i]
-            try:
-                if isinstance(widget, QDoubleSpinBox):
-                    mult = self._display_mult(i)
-                    widget.setValue(raw * mult)
-                elif isinstance(widget, QComboBox):
-                    cb_idx = widget.findData(int(raw))
-                    if cb_idx >= 0:
-                        widget.setCurrentIndex(cb_idx)
-                    else:
-                        idx = max(0, min(widget.count() - 1, int(raw)))
-                        widget.setCurrentIndex(idx)
-            except Exception:
-                pass
-        # Sync _config_values cache for config bit registers
-        for cfg_idx in (ParamIndex.CONFIG1_BITS, ParamIndex.CONFIG2_BITS):
-            ci = int(cfg_idx)
-            if ci in raw_values:
-                self._config_values[ci] = int(raw_values[ci])
+        # A fresh bulk load clears any stale FC-clamp red highlights
+        for idx in self._clamped_widgets:
+            widget = self.params.get(idx)
+            if isinstance(widget, QDoubleSpinBox):
+                widget.setStyleSheet("""
+                    QDoubleSpinBox {
+                        padding: 1px 2px;
+                    }
+                    QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {
+                        width: 12px;
+                    }
+                """)
+        self._clamped_widgets.clear()
+        self._suppress_sim_auto = True
+        try:
+            for i, raw in raw_values.items():
+                widget = self.param_widget(i)
+                if widget is None:
+                    continue
+                try:
+                    # Block signals so programmatic bulk loads never trigger the
+                    # protected-param confirm dialogs (combo_changed/param_changed)
+                    # or their revert-on-No — a load is not a user edit. Without
+                    # this, loading a file whose AF_TYPE differs from the previous
+                    # value popped "Confirm Parameter Change" and reverted the
+                    # freshly loaded type (flying wing displayed/saved as X Quad).
+                    widget.blockSignals(True)
+                    try:
+                        if isinstance(widget, QDoubleSpinBox):
+                            mult = self._display_mult(i)
+                            display_val = raw * mult
+                            if i in self._PROTECTED_PARAMS:
+                                self._committed_values[i] = display_val
+                            widget.setValue(display_val)
+                        elif isinstance(widget, QComboBox):
+                            if i in self._PROTECTED_PARAMS:
+                                self._committed_values[i] = float(int(raw))
+                            cb_idx = self._resolve_combo_index(widget, int(raw))
+                            widget.setCurrentIndex(cb_idx)
+                        elif isinstance(widget, QSpinBox):
+                            widget.setValue(int(round(raw)))
+                    finally:
+                        widget.blockSignals(False)
+                except Exception:
+                    pass
+            # Sync _config_values cache for config bit registers
+            for cfg_idx in (ParamIndex.CONFIG1_BITS, ParamIndex.CONFIG2_BITS):
+                ci = int(cfg_idx)
+                if ci in raw_values:
+                    self._config_values[ci] = int(raw_values[ci])
+            # Re-run UI side-effects that the (now-suppressed) change signals
+            # previously drove for an AF_TYPE change. Sync setup widget first so
+            # _update_fw_style reads the freshly loaded value.
+            if hasattr(self, 'sync_setup_from_advanced'):
+                self.sync_setup_from_advanced()
+            if hasattr(self, '_update_fw_style'):
+                self._update_fw_style()
+            if hasattr(self, '_build_phys_row'):
+                self._build_phys_row()
+        finally:
+            self._suppress_sim_auto = False
 
-    def on_airframe_selected(self, index: int):
-        """User selected an airframe from the combo box → write its defaults to FC."""
-        if index < 0:
-            return
-        name = self.airframe_combo.currentText()
-        path = self.airframe_combo.itemData(index)
+    def set_flash_airframe_name(self, name: str):
+        """Record the airframe name reported by the FC config flash (tag-63
+        response). This is the SINGLE displayed name — it survives GCS restarts
+        because it lives in the FC config, not in a local GCS setting.
+        """
+        self._flash_airframe_name = name or ""
+        self._log(f"  🏷️ FC flash airframe name: \"{name}\"")
+        self._update_airframe_name_label()
 
-        # Auto-save current params to previously-selected airframe before overwriting
-        if self._current_airframe_path and self._current_airframe_path != path:
-            try:
-                raw_vals = self._raw_float_values()
-                raw_dict = {i: raw_vals[i] for i in range(self.MAX_PARAMS)}
-                prev_name, _ = af_module.parse_af_file(self._current_airframe_path)
-                text = af_module.format_af(prev_name, raw_dict)
-                with open(self._current_airframe_path, 'w') as f:
-                    f.write(text)
-                self._log(f"  💾 Auto-saved current params to \"{prev_name}\"")
-            except Exception as e:
-                self._log(f"  ⚠️ Could not auto-save to previous airframe: {e}")
+    def _update_airframe_name_label(self):
+        """Show the current airframe name next to the Load button.
 
-        if path == "__DEFAULTS__":
-            reply = QMessageBox.question(
-                self,
-                "FC Factory Defaults",
-                "Load FC factory defaults into the UI?\n\n"
-                "This will replace current parameter values.\n"
-                "You will need to press Write to send them to the FC.",
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.No
-            )
-            if reply == QMessageBox.No:
-                self.airframe_combo.setCurrentIndex(-1)
-                return
-            raw_values = {i: PARAMETER_DEFS[i].default for i in range(self.MAX_PARAMS)}
-            self._log(f"  📖 Generated {len(raw_values)} FC factory defaults")
+        The name comes from the FC config flash (single source of truth). The
+        label stays hidden until a name is present so it does not waste layout
+        space on first open.
+        """
+        name = (self._flash_airframe_name or "").strip()
+        if name:
+            self.airframe_name_label.setText(name)
+            self.airframe_name_label.show()
         else:
-            if not path or not os.path.exists(path):
-                self._log(f"  ❌ Airframe file not found: {path}")
-                return
-            reply = QMessageBox.question(
-                self,
-                "Airframe Defaults",
-                f"Load and write defaults for \"{name}\"?\n\n"
-                "This will replace current parameter values in the UI.\n"
-                "You will need to press Write to send them to the FC.",
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.No
+            self.airframe_name_label.setText("")
+            self.airframe_name_label.hide()
+
+    def set_configuration_required(self, required):
+        """Gate the parameter body on whether an airframe is configured.
+
+        Fresh/out-of-the-box or cal-cleared FC: Config.AirframeName[0]==0, so tag
+        63 arrives with an empty name and the page shows only the Load Airframe…
+        selector + a banner until a generic .af is loaded (Greg 2026-09-25).
+        Called from main_window on tag 63 — keyed on the empty airframe NAME,
+        which is the same condition the FC uses to refuse arming (Config.Empty is
+        cleared only once a name is written) — and again after a successful
+        airframe load. It is NOT keyed on AFType: the FC transmits pAFType, filled
+        from the ParamTable default eQuadXAF, so a blank FC still reports a
+        valid-looking airframe.
+        """
+        required = bool(required)
+        if required == self._configuration_required:
+            return
+        self._configuration_required = required
+        if hasattr(self, 'config_body'):
+            self.config_body.setVisible(not required)
+        if hasattr(self, 'config_banner'):
+            self.config_banner.setVisible(required)
+            self.config_banner.setText(
+                "⚠️ No airframe configured — Load Airframe… below,"
+                " then the parameters page opens."
             )
-            if reply == QMessageBox.No:
-                self.airframe_combo.setCurrentIndex(-1)
-                return
-            try:
-                read_name, raw_values = af_module.parse_af_file(path)
-                self._log(f"  📖 Loaded {len(raw_values)} params from \"{read_name}\"")
-            except Exception as e:
-                self._log(f"  ❌ Failed to parse {path}: {e}")
-                QMessageBox.critical(self, "Parse Error", str(e))
-                self.airframe_combo.setCurrentIndex(-1)
-                return
+        # Gate state shows just the Load Airframe… selector + banner; the rest
+        # of the toolbar (Save Params, status/progress) is irrelevant until an
+        # airframe is actually loaded (Greg 2026-09-25).
+        if hasattr(self, 'save_btn'):
+            self.save_btn.setVisible(not required)
+        if hasattr(self, 'commit_btn'):
+            self.commit_btn.setVisible(not required)
+        if hasattr(self, 'status_label'):
+            self.status_label.setVisible(not required)
+        # Collapse to just the selector + banner in the gate state; re-expand
+        # to fit the full parameter body once an airframe is loaded (Greg
+        # 2026-09-25).
+        self.adjustSize()
+
+    def _load_airframe(self, path: str):
+        """Load an airframe file's defaults + [LIMITS] into the UI.
+
+        Shared by the toolbar 'Load Airframe…' button and the Load Params
+        dialog. Replaces the current values in the UI only: nothing is written
+        to the FC. The loaded set is staged and the Commit button goes RED until
+        the user presses Commit, which sends the tag-77 block and reboots.
+        """
+        name = os.path.splitext(os.path.basename(path))[0] if path else ""
+
+        if not path or not os.path.exists(path):
+            self._log(f"  ❌ Airframe file not found: {path}")
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "Airframe Defaults",
+            f"Load defaults for \"{name}\"?\n\n"
+            "This replaces the current parameter values in the UI only —\n"
+            "nothing is sent to the flight controller yet. Press Commit to\n"
+            "write the new set to flash and restart the FC.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+        if reply == QMessageBox.No:
+            return
+
+        try:
+            read_name, raw_values, meta = af_module.parse_af_file(path)
+            self._log(f"  📖 Loaded {len(raw_values)} params from \"{read_name}\"")
+        except Exception as e:
+            self._log(f"  ❌ Failed to parse {path}: {e}")
+            QMessageBox.critical(self, "Parse Error", str(e))
+            return
 
         # Reset any stuck verification/write state
+        self._current_airframe_path = path
         self._verify_mode = False
         self._write_in_progress = False
+        self._flash_write_pending = False
         self._written_params = {}
         self._written_float = {}
         self._expecting_param_packet = False
         self._write_timestamp = 0
+        if self._reconnect_watchdog_timer is not None:
+            self._reconnect_watchdog_timer.stop()
+            self._reconnect_watchdog_timer = None
         if self._verification_timer:
             self._verification_timer.stop()
             self._verification_timer = None
@@ -1787,122 +4613,324 @@ class ParameterWindow(QMainWindow):
         self.reset_write_button()
         self.reset_read_button()
 
+        # Widen every spinbox to the class ceiling FIRST so no loaded value is
+        # clamped by the previous-load (stale) or factory range, THEN set
+        # values, then narrow to the .af [LIMITS] tuning range (the shrink
+        # guard in _apply_airframe_limits keeps any out-of-range stale value
+        # instead of silently moving it to lo).
+        self._airframe_limits = {}
+        self._apply_airframe_limits()
         self._set_widgets_from_raw(raw_values)
-        self._ensure_config2_fast_start()
+        # Apply .af [LIMITS] tuning ranges (fallback = class-ceiling PARAM_LIMITS)
+        self._airframe_limits = dict(meta.get('LIMITS', {}) or {})
+        self._apply_airframe_limits()
         self.update_config_display()
         self.update_rc_display()
-        self.status_label.setText(f"📝 Loaded \"{name}\" defaults — writing to FC")
-        self.status_label.setStyleSheet("color: #f39c12;")
+        # Restore character slider from .af metadata
+        if self._character_slider and 'Character' in meta:
+            try:
+                self._character_slider.setValue(int(meta['Character']))
+            except (ValueError, TypeError):
+                pass
+        self.sync_setup_from_advanced()
+        # Rebuild physics descriptor row for the loaded AF_TYPE (sync blocks signals)
+        self._build_phys_row()
+        # Load physical descriptors from .af metadata
+        phys_meta = {k: v for k, v in meta.items() if k.startswith('PHYS_')}
+        if phys_meta:
+            self._load_phys_from_metadata(phys_meta)
+        connected = bool(self.parent_window
+                         and getattr(self.parent_window, 'connected', False))
+        # Load is LOCAL only (Greg 2026-10-07): the values replace the UI and
+        # the Commit button goes RED, but nothing is written to the FC until the
+        # user presses Commit. The tag-77 block is then sent on that press
+        # (CRC-checked by the FC, written to flash in one blocking pass, and
+        # rebooted); flash is still never written in the air, since
+        # can_write_parameters()/RefreshConfig() gate on State != eInFlight.
+        self._mark_dirty()
+        self.status_label.setText(
+            f"📝 Loaded \"{name}\" into the UI — press Commit to send to the FC"
+            + ("" if connected else " (not connected)"))
+        self.status_label.setStyleSheet(
+            "color: #f39c12;" if connected else "color: #e74c3c;")
+
+        # The loaded .af name is the current airframe for the next flash commit
+        # (a later connect refreshes it from the FC config flash).
+        self._flash_airframe_name = name
+        self._update_airframe_name_label()
+
+        # An airframe is now configured — reveal the full page (if we were in
+        # the out-of-the-box banner state).
+        self.set_configuration_required(False)
+
+        # Reset protected param warnings for new airframe
+        self._warned_protected.clear()
 
         # Persist the selection
         settings = QSettings("UAVX", "Groundstation")
         settings.setValue("airframe_path", path)
-        QTimer.singleShot(100, lambda: self.write_params(silent=True))
 
     def _restore_airframe_selection(self):
         settings = QSettings("UAVX", "Groundstation")
         saved_path = settings.value("airframe_path", "")
         if not saved_path:
-            # Default: select moderate lower-powered airframe (the one actively flight-tested)
-            default_name = "Ecks_800g_Moderate"
-            for i in range(self.airframe_combo.count()):
-                path = self.airframe_combo.itemData(i)
-                if path and default_name in path:
-                    self.airframe_combo.blockSignals(True)
-                    self.airframe_combo.setCurrentIndex(i)
-                    self.airframe_combo.blockSignals(False)
-                    settings.setValue("airframe_path", path)
-                    self._current_airframe_path = path
-                    self._log(f"  Auto-selected default airframe: {default_name}")
-                    break
+            # NO default airframe (Greg 2026-09-25): an out-of-the-box FC
+            # boots eAFUnknown and the params page gates on the empty tag-63
+            # name until the user loads a generic .af. Do not quietly adopt a
+            # proposed/user airframe as a stand-in default.
             return
-        for i in range(self.airframe_combo.count()):
-            if self.airframe_combo.itemData(i) == saved_path:
-                self.airframe_combo.blockSignals(True)
-                self.airframe_combo.setCurrentIndex(i)
-                self.airframe_combo.blockSignals(False)
-                break
+        self._current_airframe_path = saved_path
 
-    def _ensure_config2_fast_start(self):
-        """Ensure Config2 has Fast Start bit set (bit 1) and bit 0 clear"""
-        idx = int(ParamIndex.CONFIG2_BITS)
-        config2 = self._config_values.get(idx, 0)
-        corrected = (config2 & ~1) | 2  # Set bit 1, clear bit 0
-        if config2 != corrected:
-            self._log(f"  🔧 FIXING Config2 at {ParamIndex.CONFIG2_BITS.name}: {config2} -> {corrected}")
-            self._config_values[idx] = corrected
-            if idx in self.params and isinstance(self.params[idx], QDoubleSpinBox):
-                self.params[idx].setValue(corrected)
-                self._log(f"  🔧 Config2 widget synced to {corrected}")
-            self.dirty_params.add(idx)
-    
+    def combo_changed(self, idx: int, value: int = None):
 
-    
-    def combo_changed(self, idx: int, value: int):
+        # Derive authoritative FC value from widget data
+        if value is None:
+            widget = self.params.get(idx)
+            if widget:
+                data = widget.currentData()
+                value = int(data) if data is not None else widget.currentIndex()
+        # Confirmation dialog for safety-critical combo params (only once per session)
+        if idx in self._PROTECTED_PARAMS and idx not in self._warned_protected:
+            old_val = self._committed_values.get(idx, float(value))
+            if abs(float(value) - old_val) > 0.001:
+                name = self._param_display_name(idx)
+                warning = self._PROTECTED_WARNINGS.get(idx, "This parameter affects critical behavior.")
+                reply = QMessageBox.question(
+                    self, "Confirm Parameter Change",
+                    f"{name}\n\n"
+                    f"{warning}\n\n"
+                    f"Are you sure you want to change this?",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+                )
+                if reply == QMessageBox.No:
+                    widget = self.params[idx]
+                    widget.blockSignals(True)
+                    cb_idx = self._resolve_combo_index(widget, int(old_val))
+                    widget.setCurrentIndex(cb_idx)
+                    widget.blockSignals(False)
+                    # Keep the paired physics/setup combo consistent — otherwise
+                    # the two AF_TYPE combos diverge and a later save writes the
+                    # declined value.
+                    if hasattr(self, '_setup_widgets'):
+                        setup_w = self._setup_widgets.get(idx)
+                        if isinstance(setup_w, QComboBox) and setup_w.currentData() != int(old_val):
+                            setup_w.blockSignals(True)
+                            cb_idx = self._resolve_combo_index(setup_w, int(old_val))
+                            setup_w.setCurrentIndex(cb_idx)
+                            setup_w.blockSignals(False)
+                    if idx == int(ParamIndex.AF_TYPE):
+                        self._update_fw_style()
+                    return
+                self._warned_protected.add(idx)
+                self._committed_values[idx] = float(value)
+        elif idx in self._PROTECTED_PARAMS:
+            old_val = self._committed_values.get(idx, float(value))
+            if abs(float(value) - old_val) > 0.001:
+                self._committed_values[idx] = float(value)
         self.dirty_params.add(idx)
         self.status_label.setText(f"P{idx+1} changed ({len(self.dirty_params)})")
         self.status_label.setStyleSheet("color: #f39c12;")
-    
+        self._mark_dirty()
+        # Sync back to setup widget if this param has one (bidirectional tracking)
+        if hasattr(self, '_setup_widgets') and idx in self._setup_widgets:
+            setup_w = self._setup_widgets.get(idx)
+            if isinstance(setup_w, QComboBox):
+                adv_w = self.params.get(idx)
+                if isinstance(adv_w, QComboBox):
+                    data = adv_w.currentData()
+                    if data is not None:
+                        cb_idx = self._resolve_combo_index(setup_w, int(data))
+                        if cb_idx != setup_w.currentIndex():
+                            setup_w.blockSignals(True)
+                            setup_w.setCurrentIndex(cb_idx)
+                            setup_w.blockSignals(False)
+            if idx == int(ParamIndex.AF_TYPE):
+                self._update_fw_style()
+
     def param_changed(self, idx: int, value: float):
+        # Confirmation dialog for safety-critical params (only once per session)
+        if idx in self._PROTECTED_PARAMS and idx not in self._warned_protected:
+            old_val = self._committed_values.get(idx, value)
+            if abs(value - old_val) > 0.001:
+                name = self._param_display_name(idx)
+                warning = self._PROTECTED_WARNINGS.get(idx, "This parameter affects critical behavior.")
+                reply = QMessageBox.question(
+                    self, "Confirm Parameter Change",
+                    f"{name}\n\n"
+                    f"{warning}\n\n"
+                    f"Current: {old_val:.4f}\nProposed: {value:.4f}\n\n"
+                    f"Are you sure you want to change this?",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+                )
+                if reply == QMessageBox.No:
+                    widget = self.params[idx]
+                    widget.blockSignals(True)
+                    widget.setValue(old_val)
+                    widget.blockSignals(False)
+                    return
+                self._warned_protected.add(idx)
+                self._committed_values[idx] = value
+        elif idx in self._PROTECTED_PARAMS:
+            old_val = self._committed_values.get(idx, value)
+            if abs(value - old_val) > 0.001:
+                self._committed_values[idx] = value
+
         self.dirty_params.add(idx)
         self.status_label.setText(f"P{idx+1} changed ({len(self.dirty_params)})")
         self.status_label.setStyleSheet("color: #f39c12;")
+        self._mark_dirty()
         self.update_config_display()
 
-        # Orange highlight if value outside PARAM_LIMITS (in display units)
-        if idx in self.params and isinstance(self.params[idx], QDoubleSpinBox):
-            mult = self._display_mult(idx)
-            limits = PARAM_LIMITS.get(idx, (0.0, 255.0))
-            display_lo, display_hi = limits[0] * mult, limits[1] * mult
-            widget = self.params[idx]
-            if value < display_lo or value > display_hi:
-                widget.setStyleSheet("""
-                    QDoubleSpinBox {
-                        padding: 1px 2px;
-                        background-color: #ffe0b0;
-                    }
-                    QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {
-                        width: 12px;
-                    }
-                """)
-            else:
-                widget.setStyleSheet("""
-                    QDoubleSpinBox {
-                        padding: 1px 2px;
-                    }
-                    QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {
-                        width: 12px;
-                    }
-                """)
-    def setup_connections(self):
-        from core.ack_handler import ack_handler
-        
-        self.ReadParamsButton.clicked.connect(self.read_params)
-        self.WriteParamsButton.clicked.connect(self.write_params)
-        self.load_btn.clicked.connect(self.load_params)
-        self.save_btn.clicked.connect(self.save_params)
-        self.airframe_combo.currentIndexChanged.connect(self.on_airframe_selected)
-        self._read_request_id = ack_handler.register_button(17, self.ReadParamsButton, self._on_read_success)
-        self._log(f"  Read button request_id: {self._read_request_id}")
-        
-        self._write_request_id = ack_handler.register_button(17, self.WriteParamsButton, self._on_write_success)
-        self._log(f"  Write button request_id: {self._write_request_id}")
-    
+        # Tuning param edit → debounced auto robustness check
+        if idx in self._PARAM_CURVES:
+            self._schedule_sim_check()
+            self._check_cascade_sanity()
 
-    
+        # Orange highlight if value outside PARAM_LIMITS (in display units)
+        if idx in self.params:
+            widget = self.params[idx]
+            if isinstance(widget, QDoubleSpinBox):
+                mult = self._display_mult(idx)
+                limits = PARAM_LIMITS.get(idx, (0.0, 255.0))
+                display_lo, display_hi = limits[0] * mult, limits[1] * mult
+                if value < display_lo or value > display_hi:
+                    widget.setStyleSheet("""
+                        QDoubleSpinBox {
+                            padding: 1px 2px;
+                            background-color: #ffe0b0;
+                        }
+                    QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {
+                        width: 12px;
+                    }
+                """)
+                else:
+                    widget.setStyleSheet("""
+                        QDoubleSpinBox {
+                            padding: 1px 2px;
+                        }
+                        QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {
+                            width: 12px;
+                        }
+                    """)
+
+        # Sync back to setup widget if this param has one (bidirectional tracking)
+        if hasattr(self, '_setup_widgets') and idx in self._setup_widgets:
+            setup_w = self._setup_widgets[idx]
+            adv_w = self.params.get(idx)
+            if setup_w and adv_w:
+                if isinstance(setup_w, QComboBox) and isinstance(adv_w, QComboBox):
+                    adv_data = adv_w.currentData()
+                    if adv_data is not None:
+                        s_idx = self._resolve_combo_index(setup_w, int(adv_data))
+                        if s_idx != setup_w.currentIndex():
+                            setup_w.blockSignals(True)
+                            setup_w.setCurrentIndex(s_idx)
+                            setup_w.blockSignals(False)
+                elif isinstance(setup_w, QDoubleSpinBox) and isinstance(adv_w, QDoubleSpinBox):
+                    adv_val = adv_w.value()
+                    if abs(setup_w.value() - adv_val) > 0.001:
+                        setup_w.blockSignals(True)
+                        setup_w.setValue(adv_val)
+                        setup_w.blockSignals(False)
+
+    def setup_connections(self):
+        self.load_btn.clicked.connect(self._pick_and_load_airframe)
+        self.save_btn.clicked.connect(self.save_params)
+        self.commit_btn.clicked.connect(self._on_commit_clicked)
+
+    def _on_commit_clicked(self):
+        """Explicit Commit: send the whole local image (tag-77) and reboot."""
+        self.apply_and_reboot(confirm=True)
+
+    def _snapshot_baseline(self):
+        """Capture current widget values as the baseline for dirty detection"""
+        self._baseline_snapshot = {}
+        for idx, widget in self.params.items():
+            if isinstance(widget, QDoubleSpinBox):
+                self._baseline_snapshot[idx] = widget.value()
+            elif isinstance(widget, QComboBox):
+                self._baseline_snapshot[idx] = widget.currentData()
+            elif isinstance(widget, QSpinBox):
+                self._baseline_snapshot[idx] = widget.value()
+
+    def _source_airframe_name(self):
+        """Base name of the current airframe for default save filenames.
+
+        The currently loaded .af is the airframe actually being tuned, so its
+        filename is the save-name source. The FC config flash name (the single
+        source of truth for DISPLAY) is only a fallback for a fresh session with
+        no .af loaded — otherwise a stale flashed name would mislabel saves made
+        after a different airframe was loaded (e.g. quad params written as
+        "Shadow_..."). Greg 2026-09-17.
+        """
+        if self._current_airframe_path:
+            return os.path.splitext(os.path.basename(self._current_airframe_path))[0]
+        if self._flash_airframe_name:
+            return self._flash_airframe_name
+        return "Params"
+
+    def _base_airframe_name(self):
+        """Airframe name with trailing '_Tuned' and save-timestamp tags stripped.
+
+        Repeated saves used to compound the suffix (name_Tuned_Tuned...) because
+        the previously-saved source name was fed straight back into the next
+        save. Stripping to the true base keeps save filenames clean; a
+        date/time tag is appended by the save paths below instead. Since the
+        loaded .af is now the name source (see _source_airframe_name), a
+        previously saved file's trailing _YYYYMMDD_HHMMSS tag(s) are stripped
+        too so loading and re-saving does not compound date tags.
+        """
+        name = self._source_airframe_name().strip()
+        while name.endswith("_Tuned") or name.endswith("_tuned"):
+            name = name[: -len("_Tuned")]
+        while re.search(r"_\d{8}_\d{6}$", name):
+            name = re.sub(r"_\d{8}_\d{6}$", "", name)
+        # Guard against a last-resort empty stem so we never write "_.af".
+        return name if name else "Params"
+
     def save_params(self):
         from datetime import datetime
         raw_vals = self._raw_float_values()
         raw_dict = {i: raw_vals[i] for i in range(self.MAX_PARAMS)}
         
+        # Generate physics summary for filename
+        phys_meta = self._phys_to_metadata()
+        phys_summary = ""
+        if phys_meta:
+            parts = []
+            if 'PHYS_AUW_G' in phys_meta:
+                parts.append(f"{phys_meta['PHYS_AUW_G']}g")
+            if 'PHYS_PROP_INCH' in phys_meta:
+                parts.append(f"{phys_meta['PHYS_PROP_INCH']}in")
+            if 'PHYS_MOTOR_COUNT' in phys_meta:
+                parts.append(f"{phys_meta['PHYS_MOTOR_COUNT']}M")
+            if 'PHYS_WINGSPAN_MM' in phys_meta:
+                parts.append(f"{phys_meta['PHYS_WINGSPAN_MM']}mm")
+            phys_summary = "_".join(parts)
+        
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        suggested = f"Params_{timestamp}.af"
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Save Parameters", suggested, "Airframe Files (*.af);;All Files (*)")
-        if not path:
+        suggested = f"{self._base_airframe_name()}_{timestamp}.af"
+        
+        self._user_dir = workspace.airframes_dir()
+        dialog = AfSaveDialog(self, suggested, phys_summary, self._user_dir)
+        if dialog.exec_() != QDialog.Accepted:
             return
+        chosen = dialog.get_selected_name()
+        if not chosen:
+            return
+        # Always write into the user airframes directory (only the filename is
+        # taken from the dialog) so saved files appear in the load pulldown
+        os.makedirs(self._user_dir, exist_ok=True)
+        path = os.path.join(self._user_dir, os.path.basename(chosen))
+        if not path.lower().endswith(".af"):
+            path += ".af"
         try:
-            text = af_module.format_af("Saved Parameters", raw_dict)
+            metadata = {}
+            if self._character_slider:
+                metadata['Character'] = str(self._character_slider.value())
+            metadata.update(phys_meta)
+            metadata['LIMITS'] = dict(self._airframe_limits)
+            text = af_module.format_af("Saved Parameters", raw_dict, metadata=metadata)
             with open(path, 'w') as f:
                 f.write(text)
             self._log(f"✅ Saved {self.MAX_PARAMS} parameters to {path}")
@@ -1912,70 +4940,20 @@ class ParameterWindow(QMainWindow):
             self._log(f"❌ Save failed: {e}")
             QMessageBox.critical(self, "Save Failed", str(e))
     
-    def load_params(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Load Parameters", "", "Airframe Files (*.af);;All Files (*)")
+    def _pick_and_load_airframe(self):
+        """Open the airframe library dialog and load the selected file.
+        This is the single Load button — it opens the airframe library. The
+        button's label shows the current airframe name (from the FC config
+        flash on connect, or the file just loaded)."""
+        self._user_dir = workspace.airframes_dir()
+        dialog = AfLoadDialog(self, classify_fn=self._category_for_af_file)
+        if dialog.exec_() != QDialog.Accepted:
+            return
+        path = dialog.get_selected_path()
         if not path:
             return
-        try:
-            name, raw_values = af_module.parse_af_file(path)
-            self._log(f"  📖 Loaded {len(raw_values)} params from \"{name}\"")
-            self._set_widgets_from_raw(raw_values)
-            self._ensure_config2_fast_start()
-            self.update_config_display()
-            self.update_rc_display()
-            self.dirty_params.update(raw_values.keys())
-            self._log(f"✅ Loaded {len(raw_values)} parameters from {path}")
-            self.status_label.setText(f"✅ Loaded from {os.path.basename(path)}")
-            self.status_label.setStyleSheet("color: #27ae60;")
-        except Exception as e:
-            self._log(f"❌ Import failed: {e}")
-            QMessageBox.critical(self, "Import Failed", str(e))
-    
-    def _on_read_success(self):
-        self._log("✅ Read ACK received (fallback)")
-        self.reset_read_button()
-        self._read_request_id = None
-        
-        if self._read_timeout_timer:
-            self._read_timeout_timer.stop()
-            self._read_timeout_timer = None
-    
-    def _on_write_success(self):
-        self._log("✅ Write ACK received - automatic param packet should arrive shortly")
-        self._write_request_id = None
-        
-        if self._write_timeout_timer:
-            self._write_timeout_timer.stop()
-            self._write_timeout_timer = None
-        
-        if self._verification_timer:
-            self._verification_timer.stop()
-        
-        self._verification_timer = QTimer()
-        self._verification_timer.setSingleShot(True)
-        self._verification_timer.timeout.connect(self._verification_timeout)
-        self._verification_timer.start(3000)
-        self._log("  ⏳ Waiting for automatic param packet from FC...")
-    
-    def get_rc_data(self):
-        if self.parent_window and hasattr(self.parent_window, 'flight_data'):
-            flight_data = self.parent_window.flight_data
-            if flight_data and hasattr(flight_data, 'rc_channels'):
-                if flight_data.rc_channels:
-                    return flight_data.rc_channels
-                else:
-                    print(f"[RC] parent_window rc_channels is empty list")
-        
-        flight_data = data_manager.get_flight_data()
-        if flight_data and hasattr(flight_data, 'rc_channels'):
-            if flight_data.rc_channels:
-                return flight_data.rc_channels
-            else:
-                print(f"[RC] data_manager rc_channels is empty list")
-        
-        return None
-    
+        self._load_airframe(path)
+
     def _get_param_value(self, idx):
         """Safely get parameter value from widget"""
         if idx not in self.params:
@@ -1985,51 +4963,124 @@ class ParameterWindow(QMainWindow):
             return int(widget.value())
         elif isinstance(widget, QComboBox):
             data = widget.itemData(widget.currentIndex())
-            return data if data is not None else widget.currentIndex()
+            if data is None:
+                raise ValueError(
+                    f"Combo param {idx} selection has no data "
+                    f"(index {widget.currentIndex()}) — refusing to read a "
+                    f"positional index as the value")
+            return data
         else:
             return 0
     
+    def _rc_duplicate_map(self):
+        """Channels claimed by more than one function -> {channel: [fn names]}.
+
+        Every function in RC_MAP_PARAMS gets a spin box over all 16 channels
+        (0..15), so a channel value is only a clash if two spins hold it. This
+        is the same rule the FC applies, and it must not skip channel 0: that
+        is a legal channel and is throttle's default, so it is the single most
+        likely value to be duplicated.
+        """
+        by_channel = {}
+        for spin in self.rc_channel_spins:
+            by_channel.setdefault(spin.value(), []).append(spin)
+        dups = {}
+        for value, spins in by_channel.items():
+            if len(spins) > 1:
+                names = []
+                for spin in spins:
+                    fn_idx = spin.property("fn_index")
+                    if fn_idx is not None and fn_idx < len(self.RC_MAP_PARAMS):
+                        names.append(self.RC_MAP_PARAMS[fn_idx][1])
+                    else:
+                        names.append(f"P{spin.property('param_index') + 1}")
+                dups[value] = names
+        return dups
+
     def update_rc_display(self):
         """Update RC display using function-to-channel mapping"""
-        rc_data = self.get_rc_data()
-        
-        # Build channel-to-value map from live data
-        ch_values = {}
-        if rc_data:
-            for i, val in enumerate(rc_data[:16]):
-                ch_values[i] = val
-                self.rc_channels[i] = val
-        else:
-            for i in range(16):
-                self.rc_channels[i] = 0
-        
-        # For each function, find its assigned channel and display the live value
-        for fn_idx, (param_idx, func_name, default_ch) in enumerate(self.RC_MAP_PARAMS):
-            assigned_ch = self._get_param_value(int(param_idx))
-            val = ch_values.get(assigned_ch, 0)
-            
-            if val > 0:
-                self.rc_value_labels[fn_idx].setText(f"{val}")
-                self.rc_progress_bars[fn_idx].setRange(900, 2100)
-                self.rc_progress_bars[fn_idx].setValue(val)
-                
-                if 1450 <= val <= 1550:
-                    bg = "#27ae60"
-                elif val < 1200 or val > 1800:
-                    bg = "#f39c12"
-                else:
-                    bg = "#8bc34a"
-                self.rc_value_labels[fn_idx].setStyleSheet(
-                    f"background-color: {bg}; font-weight: bold; padding: 0px 3px;"
-                )
+        if not hasattr(self, 'rc_value_labels'):
+            return
+
+        discovered = 0
+        flight_data = self.parent_window.flight_data if self.parent_window else None
+        if flight_data:
+            discovered = getattr(flight_data, 'discovered_channels', 0)
+
+        dups = self._rc_duplicate_map()
+        for spin in self.rc_channel_spins:
+            slot = spin.value()
+            # duplicate first: it is the state the FC will refuse to arm under,
+            # so it must not be hidden behind the "channel not present" colour
+            if slot in dups:
+                style = self.RC_CH_DUP_STYLE
+            elif discovered > 0 and slot >= discovered:
+                style = self.RC_CH_BAD_STYLE
             else:
-                self.rc_value_labels[fn_idx].setText("---")
-                self.rc_progress_bars[fn_idx].setRange(900, 2100)
-                self.rc_progress_bars[fn_idx].setValue(1500)
-                self.rc_value_labels[fn_idx].setStyleSheet(
-                    "background-color: #999; font-weight: bold; padding: 0px 3px;"
-                )
-        
+                style = self.RC_CH_STYLE
+            if style != spin.property("_rc_style"):
+                spin.setStyleSheet(style)
+                spin.setProperty("_rc_style", style)
+
+        # Physical Rx channel values (RCInp[] uS as received), one per channel.
+        phys = list(getattr(flight_data, 'rc_physical', []) or []) if flight_data else []
+        ch_values = {}
+        for i, val in enumerate(phys):
+            ch_values[i] = val
+            if i < 16:
+                self.rc_channels[i] = val
+        for i in range(16):
+            self.rc_channels[i] = ch_values.get(i, 0)
+
+        show_us = self.rc_unit_btn.isChecked()
+
+        def style_label(lbl, val):
+            if val > 0.01:
+                us = round(val)
+                lbl.setText(f"{us}" if show_us else f"{round((us - 1500) / 5.0):+d}%")
+                bg = "#27ae60" if 1450 <= us <= 1550 else "#f39c12" if us < 1200 or us > 1800 else "#8bc34a"
+                style = f"background-color: {bg}; font-weight: bold; padding: 0px 3px;"
+            else:
+                lbl.setText("---")
+                style = "background-color: #999; font-weight: bold; padding: 0px 3px;"
+            if lbl.styleSheet() != style:
+                lbl.setStyleSheet(style)
+
+        def style_bar(bar, val):
+            bar.setRange(900, 2100)
+            bar.setValue(min(2100, max(900, round(val))) if val > 0.01 else 1500)
+
+        # Function rows: look up each assigned channel's physical value
+        for fn_idx, (param_idx, func_name, tc) in enumerate(self.RC_MAP_PARAMS):
+            assigned_ch = self._get_param_value(int(param_idx))
+            spin = self.rc_channel_spins[fn_idx] if hasattr(self, 'rc_channel_spins') and fn_idx < len(self.rc_channel_spins) else None
+            if discovered > 0 and assigned_ch >= discovered:
+                style = self.RC_CH_BAD_STYLE
+            else:
+                style = self.RC_CH_STYLE
+            if spin is not None and hasattr(spin, 'property'):
+                if style != spin.property("_rc_style"):
+                    spin.setStyleSheet(style)
+                    spin.setProperty("_rc_style", style)
+            val = ch_values.get(assigned_ch, 0)
+            style_label(self.rc_value_labels[fn_idx], val)
+            style_bar(self.rc_progress_bars[fn_idx], val)
+
+        # Spare channels 12-15 (third column)
+        for i in range(4):
+            slot = 12 + i
+            spin = self.rc_spare_spins[i] if hasattr(self, 'rc_spare_spins') and i < len(self.rc_spare_spins) else None
+            if discovered > 0 and slot >= discovered:
+                style = self.RC_CH_BAD_STYLE
+            else:
+                style = self.RC_CH_STYLE
+            if spin is not None and style != spin.property("_rc_style"):
+                spin.setStyleSheet(style)
+                spin.setProperty("_rc_style", style)
+            val = ch_values.get(slot, 0)
+            style_label(self.rc_spare_labels[i], val)
+            style_bar(self.rc_spare_bars[i], val)
+
         # Update motor/servo bargraphs
         flight_data = self.parent_window.flight_data if self.parent_window else None
         if flight_data:
@@ -2043,8 +5094,8 @@ class ParameterWindow(QMainWindow):
         self._config_values[pi] = value
 
     def load_default_params(self):
-        """Load default parameters — zeros until Read from FC or Import"""
-        self._log("Starting with zeros - click Read to get params from FC")
+        """Load default parameters — zeros until auto-populated from FC on connect."""
+        self._log("Starting with zeros — auto-populated from FC on connect")
         default_values = [0] * self.MAX_PARAMS
         
         for i, val in enumerate(default_values):
@@ -2056,25 +5107,44 @@ class ParameterWindow(QMainWindow):
                     max_idx = self.params[i].count() - 1
                     self.params[i].setCurrentIndex(max(0, min(max_idx, clamped)))
         
-        # Defaults: Config1 = Emulation, Config2 = Fast Start
-        self._set_config_default(ParamIndex.CONFIG1_BITS, int(Config1Bits.EMULATION_ENABLE | Config1Bits.ENFORCE_DRIVE_SYMMETRY))
-        self._set_config_default(ParamIndex.CONFIG2_BITS, int(Config2Bits.USE_FAST_START))
+        # Defaults: Config1 = RTHDescend|AltHoldAlarm, mirroring the FC's
+        # DEFAULT_CONFIG1 in params.c. It was EnforceDriveSymmetry|UsingMag here,
+        # which disagreed with both the FC default and Config1Bits.DEFAULT - the
+        # two GCS sites had drifted. eUsingMag is dropped for the arming-deadlock
+        # reason recorded at Config1Bits.DEFAULT; Config2 = Batt Comp + GPS +
+        # Nav Beep (matches the fleet-wide retune sweep).
+        self._set_config_default(ParamIndex.CONFIG1_BITS, int(Config1Bits.eUseRTHDescend | Config1Bits.eUseAltHoldAlarm))
+        self._set_config_default(ParamIndex.CONFIG2_BITS, int(Config2Bits.eUseBatteryComp | Config2Bits.eUseGPS | Config2Bits.eUseNavBeep))
         
         self.update_config_display()
         self.update_rc_display()
+        self.sync_setup_from_advanced()
         self._log("✅ Default parameters loaded")
     
     def read_params(self):
-        self._log("📖 Read button clicked - requesting parameters from FC")
+        """Request a full param download from the FC.
+
+        Called automatically on connect (on_connected → tag-71) and by the
+        post-reboot write verification; the manual Read button was removed.
+        """
+        self._log("📖 Requesting parameters from FC")
+
+        if self._flash_write_pending:
+            self._log("  ⛔ Read refused — flash write/commit outstanding (interlock)")
+            self.status_label.setText("⏳ Reading disabled until flash write completes...")
+            self.status_label.setStyleSheet("color: #f39c12;")
+            return
         
         if self.parent_window and hasattr(self.parent_window, 'can_read_parameters'):
-            if not self.parent_window.can_read_parameters():
+            safe_rd, reason_rd = self.parent_window.can_read_parameters()
+            if not safe_rd:
+                self._log(f"  ⛔ Read refused — {reason_rd}")
                 self.status_label.setText("❌ Cannot read - check connection")
                 self.status_label.setStyleSheet("color: #e74c3c;")
                 return
         
         if self.parent_window and hasattr(self.parent_window, 'flight_data'):
-            if self.parent_window.flight_data and self.parent_window.flight_data.flight_state == FlightState.FLYING:
+            if self.parent_window.flight_data and self.parent_window.flight_data.flight_state == FlightState.eInFlight:
                 reply = QMessageBox.question(
                     self,
                     "⚠️ Warning: Aircraft is Flying",
@@ -2089,16 +5159,6 @@ class ParameterWindow(QMainWindow):
 
         self.status_label.setText("⏳ Requesting ALL 128 parameters from FC...")
         self.status_label.setStyleSheet("color: #f39c12;")
-
-        self.ReadParamsButton.setStyleSheet("""
-            QPushButton {
-                background-color: #f39c12;
-                color: white;
-                font-weight: bold;
-            }
-        """)
-        self.ReadParamsButton.setText("⏳ Waiting...")
-        self.ReadParamsButton.setEnabled(False)
 
         self._read_timeout_timer = QTimer()
         self._read_timeout_timer.setSingleShot(True)
@@ -2116,129 +5176,195 @@ class ParameterWindow(QMainWindow):
                 self._read_timeout_timer.stop()
                 self._read_timeout_timer = None
     
-    def write_params(self, silent=False):
+    def apply_and_reboot(self, confirm=True):
+        """Send the full widget image to the FC (tag-77) and reboot.
+
+        The tag-77 block sends every parameter in one CRC-checked packet and
+        makes the FC write flash and reboot. This is the ONLY path that writes
+        parameters to the FC: edits (and airframe loads) are local until Commit
+        is pressed. Reuses the existing commit tail (airframe-name persist +
+        deferred post-reboot tag-71 verification).
+
+        confirm=True asks the caller-facing "Are you sure?". confirm=False is
+        used when draining a commit that was queued behind an in-flight one and
+        has already been confirmed.
+        """
+        if self._configuration_required:
+            self._log("  ⛔ No airframe configured — load an airframe before committing")
+            self.status_label.setText("⛔ No airframe configured — load an airframe first")
+            self.status_label.setStyleSheet("color: #e74c3c;")
+            return
         if self._write_in_progress:
-            self._log("⚠️ Write already in progress")
+            # A commit cycle (RAM→flash + reboot + deferred verify) is already
+            # under way. Do NOT silently drop this request — a second Commit
+            # press arriving mid-commit would otherwise be lost. Queue it: the
+            # in-flight cycle's resolution (verify success, verify timeout, or
+            # commit NACK) drains it immediately after the cross-clears.
+            self._apply_retry_pending = True
+            self._log("⚠️ Apply & Reboot already in progress — queued; will run when the current commit cycle resolves")
+            self.status_label.setText("⏳ Commit in progress — apply queued (waiting)")
+            self.status_label.setStyleSheet("color: #f39c12;")
+            return
+        if not (self.parent_window and getattr(self.parent_window, 'connected', False)):
+            self.status_label.setText("❌ Cannot commit - no connection")
+            self.status_label.setStyleSheet("color: #e74c3c;")
             return
 
-        if not self.dirty_params:
-            self._log("📝 No changed parameters to write")
-            self.status_label.setText("✅ No changed parameters")
-            self.status_label.setStyleSheet("color: #27ae60;")
-            QMessageBox.information(self, "No Changes", "No parameters have been changed.\n\nAdjust a parameter value first, then press Write.")
-            return
+        # Never commit while the aircraft is flying — a flash erase+program
+        # mid-air stalls the control loop and motors.
+        if self.parent_window and hasattr(self.parent_window, 'can_write_parameters'):
+            safe, reason = self.parent_window.can_write_parameters()
+            if not safe:
+                QMessageBox.critical(
+                    self,
+                    "🚫 Safety Blocked!",
+                    f"Cannot commit parameters:\n\n{reason}\n\n"
+                    "Committing parameters to flash while the aircraft is flying "
+                    "is EXTREMELY DANGEROUS!\n"
+                    "Please land the aircraft before making changes."
+                )
+                self.status_label.setText(f"🚫 Blocked: {reason}")
+                self.status_label.setStyleSheet("color: #e74c3c;")
+                return
 
-        n_dirty = len(self.dirty_params)
-        self._log(f"📝 Write button clicked - writing {n_dirty} changed parameters to FC")
-
-        if not silent:
-            if self.parent_window and hasattr(self.parent_window, 'can_write_parameters'):
-                safe, reason = self.parent_window.can_write_parameters()
-                if not safe:
-                    QMessageBox.critical(
-                        self,
-                        "🚫 Safety Blocked!",
-                        f"Cannot write parameters:\n\n{reason}\n\n"
-                        "Writing parameters while the aircraft is flying is EXTREMELY DANGEROUS!\n"
-                        "Please land the aircraft before making changes."
-                    )
-                    self.status_label.setText(f"🚫 Blocked: {reason}")
-                    self.status_label.setStyleSheet("color: #e74c3c;")
-                    return
-
+        if confirm:
             state_name = "Unknown"
             if self.parent_window and hasattr(self.parent_window, 'flight_data'):
                 if self.parent_window.flight_data:
                     state_name = FLIGHT_STATE_NAMES.get(
-                        self.parent_window.flight_data.flight_state,
-                        "Unknown"
-                    )
+                        self.parent_window.flight_data.flight_state, "Unknown")
 
             reply = QMessageBox.question(
                 self,
-                "⚠️ Confirm Write",
-                f"About to write {n_dirty} changed parameter(s) to the FC.\n\n"
+                "⚠️ Confirm Apply & Reboot",
+                "Save the current parameter set to FC flash and restart the FC?\n\n"
                 f"Aircraft State: {state_name}\n"
-                f"Verification: Will read back and verify after write.\n\n"
-                f"Are you sure you want to continue?",
+                "The FC reboots only after the write is verified in flash.\n\n"
+                "Are you sure you want to continue?",
                 QMessageBox.Yes | QMessageBox.No,
                 QMessageBox.No
             )
             if reply == QMessageBox.No:
-                self.status_label.setText("Write cancelled")
+                self.status_label.setText("Apply & Reboot cancelled")
                 self.status_label.setStyleSheet("color: #666;")
                 return
 
         self._write_in_progress = True
+        self._flash_write_pending = True
+        self.status_label.setText("💾 Committing parameters to flash and restarting FC...")
+        self.status_label.setStyleSheet("color: #f39c12;")
+        self._set_commit_state('committing')
 
-        current_params = {}
-        for i in self.dirty_params:
-            if i in self.params:
-                widget = self.params[i]
-                if isinstance(widget, QDoubleSpinBox):
-                    mult = self._display_mult(i)
-                    current_params[i] = int(widget.value() / mult)
-                elif isinstance(widget, QComboBox):
-                    data = widget.currentData()
-                    current_params[i] = data if data is not None else widget.currentIndex()
-                else:
-                    current_params[i] = 0
-
-        self._written_params = current_params.copy()
-        self._written_float = self._compute_written_float(indices=current_params.keys())
+        # The verification snapshot is NOT taken here. It must be taken in
+        # _commit_to_flash, which records the widget values actually sent, so the
+        # post-reboot readback is compared against the image the FC received
+        # rather than widget state that has not been sent yet.
         self._verify_mode = True
         self._expecting_param_packet = True
         self._write_timestamp = time.time()
 
-        # Log config bit values: what we read from widget vs what _config_values cache holds
-        for ck, cn in ((ParamIndex.CONFIG1_BITS, "Config1"), (ParamIndex.CONFIG2_BITS, "Config2")):
-            ci = int(ck)
-            widget_val = current_params.get(ci, -1)
-            cache_val = self._config_values.get(ci, -1)
-            match = "✅ MATCH" if widget_val == cache_val else "❌ MISMATCH"
-            self._log(f"  📋 {cn}[{ci}]: widget_spinbox={widget_val}, _config_values={cache_val} {match}")
-        
-        self._log(f"  📦 Stored {len(self._written_params)} params for verification")
-        first_10 = {k: v for k, v in list(self._written_params.items())[:10]}
-        self._log(f"  📝 First 10 params: {first_10}")
-        self._log(f"  🔑 _verify_mode={self._verify_mode}, _expecting_param_packet={self._expecting_param_packet}")
-        self._log(f"  ⏱️ Write timestamp: {self._write_timestamp}")
+        # Edits are local, so there is no tag-17 queue to drain or abort: the
+        # tag-77 block IS the whole set. Send it.
+        self._commit_to_flash()
 
-        self.status_label.setText(f"⏳ Writing {n_dirty} changed parameter(s) to FC...")
-        self.status_label.setStyleSheet("color: #f39c12;")
+    def _drain_queued_apply(self):
+        """Run an Apply & Reboot that was queued while another commit was in flight.
 
-        self.WriteParamsButton.setStyleSheet("""
-            QPushButton {
-                background-color: #f39c12;
-                color: white;
-                font-weight: bold;
-            }
-        """)
-        self.WriteParamsButton.setText("⏳ Writing...")
-        self.WriteParamsButton.setEnabled(False)
+        Called on every interlock release (verify success, verify timeout,
+        commit NACK, write timeout). Re-invokes apply_and_reboot(confirm=False)
+        — the queued request was a second Commit already confirmed by the user,
+        so re-prompting is wrong.
+        """
+        if getattr(self, '_apply_retry_pending', False):
+            self._apply_retry_pending = False
+            self._log("  🔁 Running queued Apply & Reboot")
+            self.apply_and_reboot(confirm=False)
 
-        self._write_timeout_timer = QTimer()
-        self._write_timeout_timer.setSingleShot(True)
-        self._write_timeout_timer.timeout.connect(self._write_timeout)
-        self._write_timeout_timer.start(5000)
+    def _snapshot_written_image(self):
+        """Record the image the FC is expected to hold, for the post-reboot verify.
 
-        # Send only dirty params; _on_params_typed_sent will also add Config1/Config2 if needed
-        dirty_indices = sorted(self.dirty_params)
-        if self.parent_window and hasattr(self.parent_window, 'send_params_typed'):
-            self.parent_window.send_params_typed(on_complete=self._on_params_typed_sent, indices=dirty_indices)
-        else:
-            self.status_label.setText("❌ Cannot write - no connection")
+        Called from _commit_to_flash immediately before the tag-77 block is
+        sent, so the snapshot is exactly the image the FC receives. It is the
+        baseline the post-reboot tag-71 readback is compared against.
+        """
+        self._written_float = self._compute_written_float()
+        self._written_params = {}
+        for i in range(self.MAX_PARAMS):
+            widget = self.param_widget(i)
+            if widget is None:
+                continue
+            if i == int(ParamIndex.POWER_RESET_CAUSE):
+                continue
+            if isinstance(widget, QDoubleSpinBox):
+                mult = self._display_mult(i)
+                self._written_params[i] = int(widget.value() / mult)
+            elif isinstance(widget, QSpinBox):
+                self._written_params[i] = int(widget.value())
+            elif isinstance(widget, QComboBox):
+                data = widget.currentData()
+                self._written_params[i] = int(data) if data is not None else widget.currentIndex()
+
+    def _commit_to_flash(self):
+        """Persist the airframe name and commit the full image via tag-77.
+
+        The tag-77 block carries every parameter, so it replaces both the
+        tag-17 batch and the tag-72 commit: the FC verifies the CRC, writes the
+        whole config to flash in one blocking pass, conditions it, ACKs, and
+        reboots. AFName is staged first (tag 75) so it rides the same config
+        write — `RefreshConfig` writes the whole ConfigStruct including the name.
+        """
+        self._snapshot_written_image()
+        self.dirty_params.clear()
+        if self.parent_window and hasattr(self.parent_window, 'send_afname'):
+            self.parent_window.send_afname(self._airframe_name_to_persist())
+        if self.parent_window and hasattr(self.parent_window, 'send_param_image'):
+            self.parent_window.send_param_image()
+        # Don't verify immediately — FC resets after commit. Defer until tag 68
+        # (SendRebootInfoPacket, one call at the end of InitHarness) reports the
+        # reboot from the FC that came back: the FC streams at 10 Hz and waits
+        # 500 ms after its commit ACK before resetting, so any packet arriving
+        # before the reset is still the OLD boot.
+        self._log("  ⏳ Waiting for FC to reboot and reconnect after commit...")
+        if self.parent_window:
+            self.parent_window._pending_param_verification = True
+        # Arm a watchdog: if the FC reboots but never streams a flight packet
+        # again (stuck at a boot gate / eAFUnknown + cleared cal), the deferred
+        # verification can never fire and the commit interlock would stay set
+        # forever, silently aborting every later Apply & Reboot. Break the
+        # stall loudly so a reconnect / manual commit can recover.
+        if self._reconnect_watchdog_timer is not None:
+            self._reconnect_watchdog_timer.stop()
+        self._reconnect_watchdog_timer = QTimer()
+        self._reconnect_watchdog_timer.setSingleShot(True)
+        self._reconnect_watchdog_timer.timeout.connect(self._reconnect_watchdog_timeout)
+        self._reconnect_watchdog_timer.start(25000)
+
+    def _reconnect_watchdog_timeout(self):
+        """The FC never reconnected (no flight packet) after a commit+reboot.
+
+        The deferred post-reboot verification is keyed on the first flight
+        packet seen AFTER the reboot was observed, so a silent FC leaves
+        `_pending_param_verification` True and the commit interlock latched —
+        every later Apply & Reboot is dropped at the interlock check. Release
+        the latches loudly so the user can reconnect / re-verify rather than
+        being silently frozen out.
+        """
+        self._reconnect_watchdog_timer = None
+        if self.parent_window and getattr(self.parent_window, '_pending_param_verification', False):
+            self.parent_window._pending_param_verification = False
+        if self._write_in_progress or self._flash_write_pending:
+            self._log("⚠️ FC did not reconnect after commit+reboot — releasing commit interlock (verify flash manually)")
+            self.status_label.setText("⚠️ No reconnect after commit — release interlock; verify flash load manually")
             self.status_label.setStyleSheet("color: #e74c3c;")
+            self._set_commit_state('pending')
             self._write_in_progress = False
+            self._flash_write_pending = False
             self._verify_mode = False
+            self._expecting_param_packet = False
             self._written_params = {}
             self._written_float = {}
-            self._expecting_param_packet = False
             self._write_timestamp = 0
-            self.reset_write_button()
-            if self._write_timeout_timer:
-                self._write_timeout_timer.stop()
-                self._write_timeout_timer = None
+            self._drain_queued_apply()
 
     def _compute_written_float(self, indices=None):
         """Compute the float32 values that will be sent — mirrors send_params_typed logic.
@@ -2247,8 +5373,8 @@ class ParameterWindow(QMainWindow):
         param_range = indices if indices is not None else range(self.MAX_PARAMS)
         floats = {}
         for i in param_range:
-            if i in self.params:
-                widget = self.params[i]
+            widget = self.param_widget(i)
+            if widget is not None:
                 if isinstance(widget, QDoubleSpinBox):
                     mult = self._display_mult(i)
                     floats[i] = widget.value() / mult
@@ -2256,28 +5382,32 @@ class ParameterWindow(QMainWindow):
                     floats[i] = float(widget.value())
                 elif isinstance(widget, QComboBox):
                     data = widget.currentData()
-                    floats[i] = float(data) if data is not None else float(widget.currentIndex())
+                    if data is None:
+                        raise ValueError(
+                            f"Combo param {i} selection has no data "
+                            f"(index {widget.currentIndex()}) — refusing to write "
+                            f"a positional index as the value")
+                    floats[i] = float(data)
                 else:
                     floats[i] = 0.0
             else:
                 floats[i] = 0.0
         return floats
 
-    def _on_params_typed_sent(self):
-        """Callback when all param packets have been sent"""
-        self._log(f"  ✅ All param packets sent ({len(self._written_params)} values)")
-        self.dirty_params.clear()
-        if self._write_timeout_timer:
-            self._write_timeout_timer.stop()
-            self._write_timeout_timer = None
-        # Commit to flash
-        if self.parent_window and hasattr(self.parent_window, 'send_param_commit'):
-            self.parent_window.send_param_commit()
-        # Don't verify immediately — FC resets after commit.
-        # Defer to when the next flight packet arrives (FC reconnected).
-        self._log("  ⏳ Waiting for FC to reconnect after commit...")
-        if self.parent_window:
-            self.parent_window._pending_param_verification = True
+    def _airframe_name_to_persist(self):
+        """Name to persist into the FC config flash on commit.
+
+        Uses the currently loaded .af file's base name (the file is the source
+        of the parameter set being written). The flash then becomes the single
+        source of truth displayable on GCS restart. "Params" is only the
+        synthetic fallback for a session with no .af loaded; a file actually
+        named Params*.af must still persist, otherwise the FC keeps an empty
+        name and the params page re-gates on every reconnect.
+        """
+        src = self._base_airframe_name()
+        if src == "Params" and not self._current_airframe_path:
+            return ""
+        return src if src else ""
 
     def _request_write_verify(self):
         """Request param readback via tagged protocol (subtag 71) for verification"""
@@ -2291,7 +5421,7 @@ class ParameterWindow(QMainWindow):
         self._verification_timer = QTimer()
         self._verification_timer.setSingleShot(True)
         self._verification_timer.timeout.connect(self._verification_timeout)
-        self._verification_timer.start(5000)
+        self._verification_timer.start(12000)
 
     def _verification_timeout(self):
         self._log("⏱️ Verification timeout - no automatic param packet received from FC")
@@ -2307,27 +5437,18 @@ class ParameterWindow(QMainWindow):
                 self._written_float = {}
                 self._expecting_param_packet = False
                 self._write_in_progress = False
+                self._flash_write_pending = False
                 self._write_timestamp = 0
                 
+                if self._reconnect_watchdog_timer is not None:
+                    self._reconnect_watchdog_timer.stop()
+                    self._reconnect_watchdog_timer = None
                 self.status_label.setText("⚠️ Verification timeout - no param packet from FC")
                 self.status_label.setStyleSheet("color: #e74c3c;")
-                
-                self.WriteParamsButton.setStyleSheet("""
-                    QPushButton {
-                        background-color: #e74c3c;
-                        color: white;
-                        font-weight: bold;
-                        border: 2px solid #c0392b;
-                        border-radius: 4px;
-                        padding: 4px 8px;
-                    }
-                    QPushButton:hover {
-                        background-color: #c0392b;
-                    }
-                """)
-                self.WriteParamsButton.setText("⏱️ Timeout")
-                self.WriteParamsButton.setEnabled(True)
-                QTimer.singleShot(3000, self.reset_write_button)
+                # Unverified: keep the button RED so the user can re-commit.
+                self._set_commit_state('pending')
+                # Interlock just released — run any commit queued behind it.
+                self._drain_queued_apply()
             else:
                 self._log("  ⏳ Still waiting for param packet...")
                 # Restart timer
@@ -2335,10 +5456,7 @@ class ParameterWindow(QMainWindow):
                 self._verification_timer.setSingleShot(True)
                 self._verification_timer.timeout.connect(self._verification_timeout)
                 self._verification_timer.start(1000)
-    
 
-            self.status_label.setText("Saved")
-    
     def closeEvent(self, event):
         data_manager.unregister_observer(self.on_data_updated)
         
@@ -2351,16 +5469,7 @@ class ParameterWindow(QMainWindow):
         if self._verification_timer:
             self._verification_timer.stop()
             self._verification_timer = None
-        
-        if self.dirty_params:
-            reply = QMessageBox.question(
-                self, "Unsaved Changes",
-                "Discard unsaved parameter changes?",
-                QMessageBox.Discard | QMessageBox.Cancel
-            )
-            if reply == QMessageBox.Cancel:
-                event.ignore()
-                return
+
         event.accept()
     
     def set_buttons_enabled(self, enabled: bool):

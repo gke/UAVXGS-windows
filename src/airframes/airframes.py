@@ -10,47 +10,42 @@ Lines starting with '#' are comments.
 Blank lines are ignored.
 ParamName matches ParamIndex enum member name (case-insensitive).
 Enum values are looked up by name from the matching protocol enum.
+
+Calibration and flight-safety work 2026-09-27 by OpenCode, Big Pickle & Friends.
 """
 
 import os
 import re
 import struct
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from protocol_enums import (
     ParamIndex, AirframeType, ESCType, RxType, ArmingMode,
     TelemetryType, RangefinderType, AirspeedSensorType,
-    IMUFilterType, Config1Bits, Config2Bits,
+    IMUFilterType, Config1Bits, Config2Bits, FailsafeAction,
     AIRFRAME_NAMES, ESC_TYPE_NAMES, RX_TYPE_NAMES, ARMING_MODE_NAMES,
-    TELEMETRY_TYPE_NAMES, RF_TYPE_NAMES, AS_SENSOR_TYPE_NAMES,
-    MOTOR_STOP_NAMES, BB_LOG_NAMES,
+    RF_TYPE_NAMES, AS_SENSOR_TYPE_NAMES,
+    MOTOR_STOP_NAMES, BB_LOG_NAMES, FAILSAFE_ACTION_NAMES,
 )
-from parameters import PARAM_SCALES, PARAM_TYPES, PARAM_DISPLAY_MULT
+from parameters import PARAM_DISPLAY_MULT
 
 AIRFRAMES_DIR = os.path.join(os.path.dirname(__file__))
 
 LINE_RE = re.compile(r'^\s*(\w+)\s*=\s*(.+?)\s*$')
 
-# Physical specification parameters for simulation (not sent to FC)
-PHYSICAL_PARAMS = {
-    'PHYS_MASS_KG': 'Mass in kg',
-    'PHYS_FRAME_MM': 'Frame size in mm (diagonal motor-to-motor)',
-    'PHYS_MOTOR_KV': 'Motor KV rating',
-    'PHYS_PROP_DIAMETER_INCH': 'Prop diameter in inches',
-    'PHYS_PROP_PITCH_INCH': 'Prop pitch in inches',
-    'PHYS_PROP_BLADES': 'Number of prop blades',
-    'PHYS_CELL_COUNT': 'Battery cell count (S)',
-    'PHYS_BATTERY_MAH': 'Battery capacity in mAh',
-    'PHYS_ARM_LEN_M': 'Arm length in meters (center to motor)',
-    'PHYS_INERTIA_ROLL_PITCH': 'Roll/Pitch inertia (kg·m²)',
-    'PHYS_INERTIA_YAW': 'Yaw inertia (kg·m²)',
-    'PHYS_MAX_THRUST_N': 'Max thrust per motor in Newtons',
-    'PHYS_CRUISE_SPEED_MS': 'Cruise speed m/s (FW only)',
-    'PHYS_MIN_SPEED_MS': 'Min speed m/s (FW only)',
-    'PHYS_MAX_SPEED_MS': 'Max speed m/s (FW only)',
-    'PHYS_LIFT_COEFF': 'Lift coefficient (FW only)',
-    'PHYS_DRAG_COEFF': 'Drag coefficient (FW only)',
+# Transitional bridge for .af files saved under the pre-rename 128-param
+# schema: params moved out of the param block into the FC Config struct were
+# renamed to UNUSED_NN. Their values are still meaningful in old files (e.g.
+# the sim cruise baseline), so map the old names forward instead of dropping
+# them. Pass-through only — a re-save writes them under the UNUSED_NN names.
+_LEGACY_PARAM_NAME_TO_TAG = {
+    'EST_CRUISE_THR': 19,       # → Unused20 (FC Config.CruiseThrottleFF)
+    'KF_ACC_U_BIAS_VAR': 72,    # → Unused73
+    'KF_BARO_VAR': 110,         # → Unused111
+    'KF_ACC_U_VAR': 111,        # → Unused112
 }
+
+
 
 ENUM_MAP: Dict[str, type] = {
     'AF_TYPE': AirframeType,
@@ -63,6 +58,7 @@ ENUM_MAP: Dict[str, type] = {
     'IMU_FILT_TYPE': IMUFilterType,
     'CONFIG1_BITS': Config1Bits,
     'CONFIG2_BITS': Config2Bits,
+    'FAILSAFE_ACTION': FailsafeAction,
     'BB_LOG_TYPE': None,
     'SERVO_SENSE': None,
     'THROTTLE_GAIN_RATE': None,
@@ -80,11 +76,11 @@ _COMBO_ENUM_MAP: Dict[int, tuple] = {
     ParamIndex.ESC_TYPE: (ESCType, ESC_TYPE_NAMES),
     ParamIndex.RX_TYPE: (RxType, RX_TYPE_NAMES),
     ParamIndex.ARMING_MODE: (ArmingMode, ARMING_MODE_NAMES),
-    ParamIndex.TELEMETRY_TYPE: (TelemetryType, TELEMETRY_TYPE_NAMES),
     ParamIndex.RF_SENSOR_TYPE: (RangefinderType, RF_TYPE_NAMES),
     ParamIndex.AS_SENSOR_TYPE: (AirspeedSensorType, AS_SENSOR_TYPE_NAMES),
     ParamIndex.MOTOR_STOP_SEL: (None, MOTOR_STOP_NAMES),
     ParamIndex.BB_LOG_TYPE: (None, BB_LOG_NAMES),
+    ParamIndex.FAILSAFE_ACTION: (FailsafeAction, FAILSAFE_ACTION_NAMES),
 }
 
 
@@ -99,6 +95,88 @@ def _enum_for_param(param_name: str):
         return None
     return None
 
+_LEGACY_ENUM_TOKENS = {
+    cls_name: {old: new for old, new in m.items()}
+    for cls_name, m in {
+        'AirframeType': {
+            'TRI': 'eTriAF', 'TRI_COAX': 'eTriCoaxAF', 'VTAIL': 'eVTailAF',
+            'QUAD': 'eQuadAF', 'QUAD_X': 'eQuadXAF', 'QUAD_COAX': 'eQuadCoaxAF',
+            'QUAD_COAX_X': 'eQuadCoaxXAF', 'HEX': 'eHexAF', 'HEX_X': 'eHexXAF',
+            'OCT': 'eOctAF', 'OCT_X': 'eOctXAF', 'HELI_90': 'eHeli90AF',
+            'BI': 'eBiAF', 'ELEVON': 'eElevonAF', 'DELTA': 'eDeltaAF',
+            'AILERON': 'eAileronAF', 'AILERON_SPOILER_FLAPS': 'eAileronSpoilerFlapsAF',
+            'AILERON_VTAIL': 'eAileronVTailAF', 'RUDDER_ELEVATOR': 'eRudderElevatorAF',
+            'DIFFERENTIAL_TWIN': 'eDifferentialTwinAF', 'VTOL': 'eVTOLAF',
+            'VTOL2': 'eVTOL2AF', 'TRACKED': 'eTrackedAF', 'FOUR_WHEEL': 'eFourWheelAF',
+            'TWO_WHEEL': 'eTwoWheelAF', 'INSTRUMENTATION': 'eInstrumentation',
+            'UNKNOWN': 'eAFUnknown',
+        },
+        'ESCType': {'FAST_PWM': 'eESCPWM', 'DC_MOTORS': 'eDCMotors',
+                    'DRIVES_DISARMED': 'eMotorsOff'},
+        'RxType': {'CPPM': 'eCPPMRx', 'FUTABA_SBUS': 'eFutabaSBusRx',
+                   'SPEKTRUM_1024': 'eSpektrum1024Rx', 'SPEKTRUM_2048': 'eSpektrum2048Rx',
+                   'CRSF': 'eCRSFRx', 'UNKNOWN': 'eUnknownRx'},
+        'ArmingMode': {'TX_ARMING': 'eTxArming', 'SWITCH_ARMING': 'eSwitchArming',
+                       'UNUSED_ARMING_2': 'eUnusedArming2',
+                       'UNUSED_ARMING_3': 'eUnusedArming3'},
+        'TelemetryType': {'UAVX_DJT': 'eUAVXDJTTelemetry', 'INAV_LUA': 'eINavLUATelemetry',
+                          'NO_TELEMETRY': 'eNoTelemetry', 'U4': 'eU4Telemetry',
+                          'U5': 'eU5Telemetry', 'U6': 'eU6Telemetry', 'U7': 'eU7Telemetry',
+                          'U8': 'eU8Telemetry'},
+        'RangefinderType': {'MAX_SONAR_CM': 'eMaxSonarcm', 'SRF_I2C_CM': 'eSRFI2Ccm',
+                            'MAX_SONAR_I2C_CM': 'eMaxSonarI2Ccm',
+                            'SHARP_IR_GP2Y0A02YK': 'eSharpIRGP2Y0A02YK',
+                            'SHARP_IR_GP2Y0A710K': 'eSharpIRGP2Y0A710K', 'NO_RF': 'eNoRF'},
+        'AirspeedSensorType': {'MS4525D0_I2C': 'eMS4525D0I2C',
+                               'MPXV7002DP_ANALOG': 'eMPXV7002DPAnalog',
+                               'AS_THERMOPILE_ANALOG': 'eASThermopileAnalog',
+                               'AS_GPS_DERIVED': 'eASGPSDerived', 'NO_AS': 'eNoAS'},
+        'IMUFilterType': {'LPFILT': 'eLP2Filt', 'MPUFILT': 'eHDLPFilt',
+                          'PT1FILT': 'eF1', 'IMU_FILT_3': 'eF2', 'IMU_FILT_4': 'eF3',
+                          'IMU_FILT_5': 'eF4'},
+        'Config1Bits': {'USE_INVERT_MAG': 'eUseInvertMag', 'USE_RTH_DESCEND': 'eUseRTHDescend',
+                        'DISABLE_LEDS_IN_FLIGHT': 'eUsingMag',
+                        'USE_MAG': 'eUsingMag',
+                        'EMULATION_ENABLE': 'eEmulationEnable',
+                        'USE_ALT_HOLD_ALARM': 'eUseAltHoldAlarm',
+                        'USE_OFFSET_HOME': 'eUseOffsetHome',
+                        'TEST_MISSION': 'eUnused1_6',
+                        'ENFORCE_DRIVE_SYMMETRY': 'eEnforceDriveSymmetry'},
+        'Config2Bits': {'USE_BATTERY_COMP': 'eUseBatteryComp', 'USE_FAST_START': 'eUnused2_1',
+                        'USE_ESC_PROG': 'eUnused2_2', 'USE_BLHELI': 'eUnused2_2', 'USE_HAVE_GPS': 'eUseGPS',
+                        'USE_PROP_SENSE': 'ePropsInwards', 'USE_TURN_TO_WP': 'eUseTurnToWP',
+                        'USE_NAV_BEEP': 'eUseNavBeep'},
+        'FailsafeAction': {'FS_RTH': 'eFsRth', 'FS_Land': 'eFsLand',
+                           'FS_MOTORS_OFF': 'eFsMotorsOff'},
+    }.items()
+}
+
+
+def _resolve_enum_member(enum_cls, token: str):
+    """Resolve an .af enum token to an enum member.
+
+    Order: exact match -> case-insensitive match -> legacy UPPER token -> None.
+    Handles both new e-* tokens and pre-sweep UPPER-SNAKE tokens.
+    """
+    if enum_cls is None:
+        return None
+    t = token.strip()
+    try:
+        return enum_cls[t]
+    except (KeyError, ValueError):
+        pass
+    for name, member in enum_cls.__members__.items():
+        if name.lower() == t.lower():
+            return member
+    legacy = _LEGACY_ENUM_TOKENS.get(enum_cls.__name__)
+    if legacy and t in legacy:
+        try:
+            return enum_cls[legacy[t]]
+        except (KeyError, ValueError):
+            pass
+    return None
+
+
 def _find_enum(param_name: str, raw_value: float) -> str:
     """Convert raw float value → enum name for a known enum param."""
     for enum_cls in ENUM_MAP.values():
@@ -111,8 +189,30 @@ def _find_enum(param_name: str, raw_value: float) -> str:
     return None
 
 
+def _resolve_owned_or_any(enum_cls: type, token: str):
+    """Resolve a token against the param's own enum first, then any other.
+
+    Bare ambiguity-prone tokens (e.g. `DEFAULT`) exist on more than one
+    IntFlag, so the param's owning enum must take precedence, else
+    `CONFIG2_BITS = DEFAULT` resolves as Config1Bits.DEFAULT (0x16) instead
+    of Config2Bits.DEFAULT (0x4B).
+    """
+    if enum_cls is not None:
+        member = _resolve_enum_member(enum_cls, token)
+        if member is not None:
+            return member
+    for cls in ENUM_MAP.values():
+        if cls is None or cls is enum_cls:
+            continue
+        member = _resolve_enum_member(cls, token)
+        if member is not None:
+            return member
+    return None
+
+
 def _parse_value(param_name: str, text: str) -> float:
     """Parse a human-readable value string back to raw float."""
+    owned = _enum_for_param(param_name)
     text = text.strip()
     # Hex
     if text.startswith('0x') or text.startswith('0X'):
@@ -120,31 +220,21 @@ def _parse_value(param_name: str, text: str) -> float:
     # Pipe-separated IntFlag combination
     if '|' in text:
         total = 0
+        found_all = True
         for part in text.split('|'):
             part = part.strip()
-            found = False
-            for enum_cls in ENUM_MAP.values():
-                if enum_cls is None:
-                    continue
-                try:
-                    total += enum_cls[part.upper()].value
-                    found = True
-                    break
-                except (KeyError, AttributeError):
-                    pass
-            if not found:
+            member = _resolve_owned_or_any(owned, part)
+            if member is None:
                 # If any part unrecognized, fall through to plain float
+                found_all = False
                 break
-        else:
+            total += member.value
+        if found_all:
             return float(total)
     # Try enum name lookup
-    for enum_cls in ENUM_MAP.values():
-        if enum_cls is None:
-            continue
-        try:
-            return float(enum_cls[text.upper()].value)
-        except (KeyError, AttributeError):
-            pass
+    member = _resolve_owned_or_any(owned, text)
+    if member is not None:
+        return float(member.value)
     # Plain float
     return float(text)
 
@@ -165,49 +255,103 @@ def _format_value(param_name: str, raw_value: float) -> str:
         if i > 9:
             return str(i)
     if abs(raw_value) < 0.001:
-        return f'{raw_value:.6g}'
+        return f'{raw_value:.8g}'
     if raw_value == int(raw_value) and abs(raw_value) < 1e9:
         return str(int(raw_value))
-    return f'{raw_value:.6g}'
+    return f'{raw_value:.8g}'
 
 
-def parse_af(text: str) -> Tuple[str, Dict[int, float]]:
-    """Parse .af file text → (name, {tag: raw_float_value})."""
+def parse_af(text: str) -> Tuple[str, Dict[int, float], Dict[str, Any]]:
+    """Parse .af file text → (name, {tag: raw_float_value}, metadata_dict).
+
+    metadata_dict contains:
+      - 'Name', 'Character' from '# Key: Value' comment lines
+      - 'PHYS_*' keys from PHYS_* = value lines (physical descriptors)
+      - 'LIMITS': {tag: (lo, hi)} from an optional [LIMITS] block (raw units)
+    """
     name = 'Unknown'
     values: Dict[int, float] = {}
+    metadata: Dict[str, Any] = {}
+    limits: Dict[int, Tuple[float, float]] = {}
+    in_limits = False
     for line in text.splitlines():
         line = line.strip()
         if not line or line.startswith('#'):
             if line.startswith('# ') and name == 'Unknown':
-                name = line[2:].strip()
+                rest = line[2:].strip()
+                if ':' in rest and not rest.startswith(' '):
+                    key, val = rest.split(':', 1)
+                    key = key.strip()
+                    val = val.strip()
+                    if key in ('Name', 'Character'):
+                        metadata[key] = val
+                else:
+                    name = rest
+            continue
+        if line.upper() == '[LIMITS]':
+            in_limits = True
             continue
         m = LINE_RE.match(line)
         if not m:
             continue
         param_name = m.group(1).strip().upper()
         value_text = m.group(2).strip()
-        # Find tag by name
+        if param_name.startswith('PHYS_'):
+            metadata[param_name] = value_text
+            continue
         tag = None
         try:
             tag = ParamIndex[param_name].value
         except KeyError:
-            pass
+            tag = _LEGACY_PARAM_NAME_TO_TAG.get(param_name)
         if tag is None:
+            continue
+        if in_limits:
+            parts = value_text.split(',')
+            if len(parts) != 2:
+                continue
+            try:
+                limits[tag] = (float(parts[0].strip()), float(parts[1].strip()))
+            except ValueError:
+                continue
             continue
         val = _parse_value(param_name, value_text)
         values[tag] = val
-    return name, values
+    if limits:
+        metadata['LIMITS'] = limits
+    return name, values, metadata
 
 
-def parse_af_file(path: str) -> Tuple[str, Dict[int, float]]:
-    """Read an .af file from disk and parse it → (name, {tag: raw_float})."""
+def parse_af_file(path: str) -> Tuple[str, Dict[int, float], Dict[str, Any]]:
+    """Read an .af file from disk and parse it → (name, {tag: raw_float}, metadata)."""
     with open(path) as f:
         return parse_af(f.read())
 
 
-def format_af(name: str, values: Dict[int, float]) -> str:
-    """Format param values → .af file text."""
+def format_af(name: str, values: Dict[int, float], metadata: Dict[str, Any] = None) -> str:
+    """Format param values → .af file text.
+
+    Optional metadata stored as:
+      - '# Key: Value' comment lines for Name, Character
+      - 'PHYS_KEY = Value' lines for physical descriptors and derived quantities
+      - 'LIMITS': {tag: (lo, hi)} emitted as a [LIMITS] block (raw units)
+    """
     lines = [f'# {name}', '']
+    phys_lines = []
+    limits = None
+    if metadata:
+        limits = metadata.get('LIMITS')
+        for k, v in metadata.items():
+            if k == 'LIMITS':
+                continue
+            if k.startswith('PHYS_'):
+                phys_lines.append(f'{k} = {v}')
+            else:
+                lines.append(f'# {k}: {v}')
+        if phys_lines:
+            lines.append('')
+            lines.extend(phys_lines)
+            lines.append('')
     for i in range(128):
         if i not in values:
             continue
@@ -218,29 +362,59 @@ def format_af(name: str, values: Dict[int, float]) -> str:
         raw = values[i]
         formatted = _format_value(param_name, raw)
         lines.append(f'{param_name} = {formatted}')
+    if limits:
+        lines.append('')
+        lines.append('[LIMITS]')
+        for tag in sorted(limits):
+            lo, hi = limits[tag]
+            try:
+                param_name = ParamIndex(tag).name
+            except ValueError:
+                param_name = f'UNUSED_{tag}'
+            lines.append(f'{param_name} = {lo:.8g}, {hi:.8g}')
     lines.append('')
     return '\n'.join(lines)
 
 
-def _raw_float_for_display(tag: int, display_val: float) -> float:
-    """Convert GCS display value to raw float for .af storage / FC write."""
-    mult = PARAM_DISPLAY_MULT.get(tag, 1.0)
+def _raw_float_for_display(tag: int, display_val: float,
+                           mult: Optional[float] = None) -> float:
+    """Convert GCS display value to raw float for .af storage / FC write.
+
+    `mult` is the effective display multiplier (mode-aware: the UI passes
+    the legacy `1/scale` in Legacy mode, else `PARAM_DISPLAY_MULT`). A
+    legacy-scaled spinbox value MUST be rescaled by its mode multiplier
+    before any write — these functions never assume raw == display.
+    """
+    if mult is None:
+        mult = PARAM_DISPLAY_MULT.get(tag, 1.0)
     return display_val / mult
 
 
-def _display_for_raw_float(tag: int, raw_val: float) -> float:
+def _display_for_raw_float(tag: int, raw_val: float,
+                           mult: Optional[float] = None) -> float:
     """Convert raw float to GCS display value."""
-    mult = PARAM_DISPLAY_MULT.get(tag, 1.0)
+    if mult is None:
+        mult = PARAM_DISPLAY_MULT.get(tag, 1.0)
     return raw_val * mult
 
 
-def export_af_from_widgets(name: str, params: Dict[int, object]) -> str:
-    """Export current widget values as .af text."""
+def export_af_from_widgets(name: str, params: Dict[int, object],
+                           limits: Dict[int, Tuple[float, float]] = None,
+                           mult_fn=None) -> str:
+    """Export current widget values as .af text.
+
+    Optional `limits` {tag: (lo, hi)} raw is emitted as a [LIMITS] block.
+    `mult_fn(tag) -> float` returns the effective display multiplier
+    (mode-aware). If omitted, plain PARAM_DISPLAY_MULT is used — callers in
+    Legacy mode MUST pass the legacy `1/scale` mapping or the exported
+    values will be legacy-scaled raw, not raw.
+    """
     from parameter_window import QDoubleSpinBox, QComboBox
     raw_values: Dict[int, float] = {}
     for tag, widget in params.items():
         if isinstance(widget, QDoubleSpinBox):
-            raw = _raw_float_for_display(tag, widget.value())
+            mult = mult_fn(tag) if mult_fn else PARAM_DISPLAY_MULT.get(tag, 1.0)
+            raw = _raw_float_for_display(tag, widget.value(), mult)
             raw_values[tag] = raw
         elif isinstance(widget, QComboBox):
             # Reverse-resolve display name → enum value for alphabetically-sorted combos
@@ -257,19 +431,21 @@ def export_af_from_widgets(name: str, params: Dict[int, object]) -> str:
                     raw_values[tag] = float(widget.currentIndex())
             else:
                 raw_values[tag] = float(widget.currentIndex())
-    return format_af(name, raw_values)
+    return format_af(name, raw_values, metadata={'LIMITS': limits} if limits else None)
 
 
-def import_to_widgets(name: str, af_text: str, params: Dict[int, object]) -> str:
+def import_to_widgets(name: str, af_text: str, params: Dict[int, object],
+                      mult_fn=None) -> str:
     """Parse .af text and set widget values. Returns airframe name."""
-    af_name, raw_values = parse_af(af_text)
+    af_name, raw_values, _meta = parse_af(af_text)
     from parameter_window import QDoubleSpinBox, QComboBox
     for tag, raw_val in raw_values.items():
         if tag not in params:
             continue
         widget = params[tag]
         if isinstance(widget, QDoubleSpinBox):
-            widget.setValue(_display_for_raw_float(tag, raw_val))
+            mult = mult_fn(tag) if mult_fn else PARAM_DISPLAY_MULT.get(tag, 1.0)
+            widget.setValue(_display_for_raw_float(tag, raw_val, mult))
         elif isinstance(widget, QComboBox):
             # Resolve raw enum value → display name for alphabetically-sorted combos
             display = None
@@ -300,6 +476,6 @@ def list_airframes() -> List[Tuple[str, str]]:
         if not fn.endswith('.af'):
             continue
         path = os.path.join(AIRFRAMES_DIR, fn)
-        name, _ = parse_af_file(path)
+        name, _, _meta = parse_af_file(path)
         results.append((name, path))
     return results

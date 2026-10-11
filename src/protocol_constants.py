@@ -73,44 +73,44 @@ def raw_to_percent(raw_value: int) -> float:
 # ============================================================================
 # Backward Compatibility - Flight State Names (use FlightState.get_name())
 # ============================================================================
-FLIGHT_STATE_NAMES = {i: FlightState.get_name(i) for i in range(13)}
+FLIGHT_STATE_NAMES = {i: FlightState.get_name(i) for i in FlightState}
 NAV_STATE_NAMES = {i: NavState.get_name(i) for i in range(20)}
 
 # Keep old constants for backward compatibility
-FLIGHT_STARTING = FlightState.STARTING
-FLIGHT_WARMUP = FlightState.WARMUP
-FLIGHT_LANDING = FlightState.LANDING
-FLIGHT_LANDED = FlightState.LANDED
-FLIGHT_SHUTDOWN = FlightState.SHUTDOWN
-FLIGHT_FLYING = FlightState.FLYING
-FLIGHT_IREMULATE = FlightState.IREMULATE
-FLIGHT_PREFLIGHT = FlightState.PREFLIGHT
-FLIGHT_READY = FlightState.READY
-FLIGHT_THROTTLE_OPEN_CHECK = FlightState.THROTTLE_OPEN_CHECK
-FLIGHT_ERECTING_GYROS = FlightState.ERECTING_GYROS
-FLIGHT_MONITOR_INSTRUMENTS = FlightState.MONITOR_INSTRUMENTS
-FLIGHT_INITIALISING_GPS = FlightState.INITIALISING_GPS
+FLIGHT_STARTING = FlightState.eStarting
+FLIGHT_WARMUP = FlightState.eWarmup
+FLIGHT_LANDING = FlightState.eLanding
+FLIGHT_LANDED = FlightState.eLanded
+FLIGHT_SHUTDOWN = FlightState.eShutdown
+FLIGHT_FLYING = FlightState.eInFlight
+FLIGHT_IREMULATE = FlightState.eIREmulateUNUSED
+FLIGHT_PREFLIGHT = FlightState.ePreflight
+FLIGHT_READY = FlightState.eReady
+FLIGHT_THROTTLE_OPEN_CHECK = FlightState.eThrottleOpenCheck
+FLIGHT_ERECTING_GYROS = FlightState.eErectingGyros
+FLIGHT_MONITOR_INSTRUMENTS = FlightState.eMonitorInstruments
+FLIGHT_INITIALISING_GPS = FlightState.eInitialisingGPS
 
-NAV_HOLDING_STATION = NavState.HOLDING_STATION
-NAV_RETURNING_HOME = NavState.RETURNING_HOME
-NAV_AT_HOME = NavState.AT_HOME
-NAV_DESCENDING = NavState.DESCENDING
-NAV_TOUCHDOWN = NavState.TOUCHDOWN
-NAV_TRANSITING = NavState.TRANSITING
-NAV_LOITERING = NavState.LOITERING
-NAV_ORBITING_POI = NavState.ORBITING_POI
-NAV_PERCHING = NavState.PERCHING
-NAV_TAKEOFF = NavState.TAKEOFF
-NAV_PIC = NavState.PIC
-NAV_ACQUIRING_ALTITUDE = NavState.ACQUIRING_ALTITUDE
-NAV_USING_THERMAL = NavState.USING_THERMAL
-NAV_USING_RIDGE = NavState.USING_RIDGE
-NAV_USING_WAVE = NavState.USING_WAVE
-NAV_BOOST_CLIMB = NavState.BOOST_CLIMB
-NAV_ALTITUDE_LIMITING = NavState.ALTITUDE_LIMITING
-NAV_JUST_GLIDING = NavState.JUST_GLIDING
-NAV_WP_ALT_FAIL = NavState.WP_ALT_FAIL
-NAV_WP_PROXIMITY_FAIL = NavState.WP_PROXIMITY_FAIL
+NAV_HOLDING_STATION = NavState.eHoldingStation
+NAV_RETURNING_HOME = NavState.eReturningHome
+NAV_AT_HOME = NavState.eAtHome
+NAV_DESCENDING = NavState.eDescending
+NAV_TOUCHDOWN = NavState.eTouchdown
+NAV_TRANSITING = NavState.eTransiting
+NAV_LOITERING = NavState.eLoitering
+NAV_ORBITING_POI = NavState.eOrbitingPOI
+NAV_PERCHING = NavState.ePerching
+NAV_TAKEOFF = NavState.eTakeoff
+NAV_PIC = NavState.ePIC
+NAV_ACQUIRING_ALTITUDE = NavState.eAcquiringAltitude
+NAV_USING_THERMAL = NavState.eUsingThermal
+NAV_USING_RIDGE = NavState.eUsingRidge
+NAV_USING_WAVE = NavState.eUsingWave
+NAV_BOOST_CLIMB = NavState.eBoostClimb
+NAV_ALTITUDE_LIMITING = NavState.eAltitudeLimiting
+NAV_JUST_GLIDING = NavState.eJustGliding
+NAV_WP_ALT_FAIL = NavState.eWPAltFail
+NAV_WP_PROXIMITY_FAIL = NavState.eWPProximityFail
 
 # Re-export all enums and helpers
 __all__ = [

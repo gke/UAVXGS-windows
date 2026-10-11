@@ -22,7 +22,7 @@ After `build.bat` succeeds:
 1. Run `build.bat` again — it will offer to install **Inno Setup** automatically
 2. Or install manually from https://jrsoftware.org/isdl.php
 3. Right-click **`installer.iss`** → **Compile**
-4. The installer appears in `installer_output\UAVX_GCS_Setup_0.1.0.exe`
+4. The installer appears in `installer_output\UAVX_GCS_Setup_0.2.0.exe`
 
 Share this `.exe` — users just click through to install with Start Menu / Desktop shortcuts.
 
@@ -39,8 +39,28 @@ UAVXGS/
     │   ├── ui/             — Qt UI modules
     │   ├── core/           — data manager, speech, etc.
     │   └── airframes/      — .af tuning files
-    └── UAVXF4V3Q_r16.bin   ← pre-compiled FC firmware
+    └── UAVXF4V3Q_r0.bin    ← pre-compiled FC firmware
 ```
+
+## Flight-Controller Firmware
+
+The kit bundles the current flight-controller firmware image, `UAVXF4V3Q_r0.bin`
+(STM32F4 targets). To flash it:
+
+1. Put the board into DFU/bootloader mode: hold **BOOT0** and tap reset (or
+   power-cycle while BOOT0 is held), then release.
+2. Flash the image (install `dfu-util`, or use **STM32CubeProgrammer**):
+
+   ```
+   dfu-util -a 0 -s 0x08000000:leave -D UAVXF4V3Q_r0.bin
+   ```
+
+   In STM32CubeProgrammer, select the `.bin` and set the start address to
+   `0x08000000`.
+3. Power-cycle the board; it should respond in the GCS.
+
+When updating over USB, the GCS **BOOTLOAD** button can put a running board into
+bootloader mode, so no BOOT0 link is needed.
 
 ## Notes
 

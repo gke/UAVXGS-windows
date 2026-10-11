@@ -1,4 +1,5 @@
 import os
+import time
 from typing import Optional
 from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
@@ -18,7 +19,7 @@ class DfuUsbWorker(QThread):
     progress = pyqtSignal(int, int, str)
     finished = pyqtSignal(bool, str)
 
-    def __init__(self, bin_path: str, flash_base: int = 0x08004000):
+    def __init__(self, bin_path: str, flash_base: int = 0x08000000):
         super().__init__()
         self.bin_path = bin_path
         self.flash_base = flash_base
@@ -72,7 +73,7 @@ class DfuFlasherWindow(QMainWindow):
         self.worker: Optional[QThread] = None
         self._uart_port: Optional[str] = None
         self.setWindowTitle("Firmware Flasher")
-        self.setMinimumSize(600, 400)
+        self.setMinimumSize(660, 440)
         self._build_ui()
 
     def _build_ui(self):
@@ -260,21 +261,52 @@ class DfuFlasherWindow(QMainWindow):
             self.log.append("Sent bootloader command to FC")
 
     def _enter_bootloader(self):
+        self._dfu_device = None
         if self._is_connected():
             self._send_bootloader_cmd()
             self.log.append("FC should reset into bootloader mode")
         else:
             self.log.append("Not connected to FC — put FC in bootloader mode manually (BOOT0+RESET)")
 
-    def _scan(self):
-        self.log.append("Scanning for DFU devices...")
-        devices = find_dfu_devices()
-        if not devices:
-            self.device_label.setText("No DFU device found")
-            self.device_label.setStyleSheet("color: red; padding: 2px;")
-            self.log.append("  No DFU devices found")
-            self._dfu_device = None
+        if self.mode_usb.isChecked():
+            # The FC re-enumerates a couple of seconds after resetting into the
+            # ROM bootloader; poll so the user does not have to hit Scan again.
+            self.log.append("Auto-scanning for the DFU device (several seconds)...")
+            self._scan(tries=6)
         else:
+            self._check_ready()
+
+    def _scan(self, tries=1):
+        for attempt in range(tries):
+            if tries > 1 and attempt > 0:
+                from PyQt5.QtWidgets import QApplication
+                QApplication.processEvents()
+                time.sleep(1)
+            if tries > 1:
+                self.log.append(f"Scan attempt {attempt + 1}/{tries}...")
+            diagnostics = []
+            devices = find_dfu_devices(diagnostics=diagnostics)
+            for line in diagnostics:
+                self.log.append("  " + line)
+            if not devices:
+                self._dfu_device = None
+                self.device_label.setText("No DFU device found")
+                self.device_label.setStyleSheet("color: red; padding: 2px;")
+                if not diagnostics:
+                    self.log.append(
+                        "  No USB DFU device visible. If the board uses a "
+                        "USB-serial bridge (CH340/CP210x), the STM32 ROM "
+                        "bootloader only answers over UART on the same port — "
+                        "use UART Bootloader mode instead. To see the full "
+                        "USB map, run: python3 stm32_dfu.py"
+                    )
+                else:
+                    self.log.append(
+                        "  DFU device present but blocked. Check that the GCS "
+                        "can access /dev/bus/usb (udev rule, user in plugdev, "
+                        "not a Flatpak sandbox). See: python3 stm32_dfu.py"
+                    )
+                continue
             d = devices[0]
             self._dfu_device = d
             self.device_label.setText(
@@ -283,6 +315,7 @@ class DfuFlasherWindow(QMainWindow):
             )
             self.device_label.setStyleSheet("color: green; padding: 2px; font-weight: bold;")
             self.log.append(f"  Found DFU device")
+            break
         self._check_ready()
 
     def _disconnect_telemetry(self):
@@ -326,8 +359,15 @@ class DfuFlasherWindow(QMainWindow):
             self.log.append("SUCCESS: Firmware flashed!")
             self.device_label.setText("Done — device reset")
             self.device_label.setStyleSheet("color: blue; padding: 2px; font-weight: bold;")
-            if self._uart_port:
-                self.log.append(f"")
+            # DFU reset re-enumerates the FC as a fresh USB device; any
+            # telemetry connection held across the flash is now stale.
+            if self._is_connected():
+                self._disconnect_telemetry()
+            if self.mode_usb.isChecked():
+                self.log.append("")
+                self.log.append("Click 'Connect' in main window to resume telemetry on USB")
+            elif self._uart_port:
+                self.log.append("")
                 self.log.append(f"Click 'Connect' in main window to resume telemetry on {self._uart_port}")
         else:
             self.log.append("")
