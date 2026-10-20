@@ -366,8 +366,8 @@ def _fw_phys_rows(auw, wing, thrust, root, prop, curr, volt, batt):
         ("PHYS_TIP_DIHEDRAL_MM", "Tip rise (mm)",     0, 0,      "Wingtip height above the root with the wing level (negative = droops)"),
         ("PHYS_CG_MM",           "CG behind LE (mm)", 0, 0,      "Balance point behind the wing leading edge — leave blank if not measured"),
         ("PHYS_TAIL_ARM_MM",     "Tail arm (mm)",     0, 0,      "Wing root LE to stab LE"),
-        ("PHYS_STAB_CHORD_MM",   "Stab chord (mm)",   0, 0,      "Horizontal stabiliser chord"),
-        ("PHYS_STAB_SPAN_MM",    "Stab span (mm)",    0, 0,      "Horizontal stabiliser span"),
+        ("PHYS_STAB_CHORD_MM",   "Stab chord (mm)",   0, 0,      "Horizontal stabiliser chord (elevon wings: vertical fin chord)"),
+        ("PHYS_STAB_SPAN_MM",    "Stab span (mm)",    0, 0,      "Horizontal stabiliser span (elevon wings: vertical fin height)"),
         ("PHYS_MOTOR_COUNT",     "Motors",            0, 1,      "Number of motors"),
     ]
 

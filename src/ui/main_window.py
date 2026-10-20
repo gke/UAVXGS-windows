@@ -167,7 +167,7 @@ FLAG_BIT_DEFS = {
     61: ('rapid_desc', 'Diving', 'Using Rapid Descent'),
     62: ('turn_wp', 'TurnWP', 'Using Turn To WP'),
     63: ('glide', 'Glide', 'Gliding'),
-    64: ('new_mag', 'NewMag', 'New Mag Values'),
+    64: ('unused64', 'unused64', 'Reserved: NewMag removed 2026-10-18'),
     65: ('alt_hold_alarm', 'AHAlarm', 'Using Alt Hold Alarm'),
     66: ('new_gps_pos', 'NewGPSPos', 'New GPS Position'),
     67: ('sio_fatal', 'SIOFatal', 'Serial I/O Fatal'),
@@ -186,7 +186,7 @@ FLAG_BIT_DEFS = {
     80: ('bad_bus', 'BadBus', 'Bad Bus Device Config'),
     81: ('dive_mode', 'Dive', 'Dive Mode'),
     82: ('test_active', 'TestActive', 'Test Active'),
-    83: ('unused83', 'unused83', 'Reserved'),
+    83: ('mag_yaw_disagree', 'YawDrift', 'Mag/Yaw Disagreement'),
     84: ('unused84', 'unused84', 'Reserved'),
     85: ('unused85', 'unused85', 'Reserved'),
     86: ('unused86', 'unused86', 'Reserved'),
@@ -209,7 +209,7 @@ FLAG_GROUPS = [
     ('RTH / Landing', [20, 72, 45, 3, 30]),
     ('Origin / Home', [7, 28, 78]),
     ('GPS', [6, 52, 79]),
-    ('Sensors / Health', [47, 8, 10, 44, 41, 76, 55, 22]),
+    ('Sensors / Health', [47, 8, 10, 44, 41, 76, 55, 22, 83]),
     ('RC & Input', [35, 53, 75, 58, 77, 81]),
     ('Soaring / Glide', [51, 63, 69]),
     ('Flight Mode / Throttle', [25, 40, 13]),
@@ -3448,7 +3448,7 @@ class MainWindow(QMainWindow):
                     color = "#e74c3c"
                     text_color = "white"
                     font_weight = "bold"
-                elif flag_key in ['vrs', 'rc_map_fail', 'fence_alarm', 'excess_lift', 'snr', 'ext_mag', 'imu_fault_lat', 'cfg_pend']:
+                elif flag_key in ['vrs', 'rc_map_fail', 'fence_alarm', 'excess_lift', 'snr', 'ext_mag', 'imu_fault_lat', 'cfg_pend', 'mag_yaw_disagree']:
                     color = "#f39c12"
                     text_color = "white"
                     font_weight = "bold"

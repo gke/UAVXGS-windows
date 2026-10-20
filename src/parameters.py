@@ -516,13 +516,15 @@ PARAM_EXPLICIT_LIMITS: Dict[int, Tuple[float, float]] = {
     14: (0.0, 5.0),           # RxType CPPMRx..UnknownRx
     15: (0.0, 255.0),         # Config1Bits (bits 0..7)
     16: (0.0, 15.0),          # RxThrottleCh
-    17: (4.0, 20.0),          # LowVoltThres
+    17: (3.4, 20.0),          # LowVoltThres (pack volts; 3.4 V/cell LV floor)
     19: (0.0, 255.0),         # Unused20 (was EstCruiseThr — moved to FC Config.CruiseThrottleFF)
     40: (0.1, 15.0),          # NavMaxVelocity (GCS key is the legacy NAV_POS_INT_LIMIT). lo 0.1: divides in WPDistanceTimeout()
     74: (0.01, 1.047198),     # PitchAngleMax — per-tag: eClassAngle also holds pMagVariation, where 0 is legitimate
     76: (0.01, 1.047198),     # RollAngleMax — same reason as tag 74
     30: (0.2, 0.5),          # Horizon (stick fraction)
-    31: (0.0, 0.55),          # MadgwickKpMag
+    31: (0.0, 0.02),          # MadgwickKpMag (raw = display/100; FC default 0.01,
+                              # band widened to 0.02 on 2026-10-19; previously
+                              # 0.0025..0.01, before that 0.0025..0.005)
     32: (0.0, 30.0),          # NavRTHAlt
     34: (0.0, 255.0),         # UnusedSensorHint
     35: (0.0, 2.0),           # ESCType ESCPWM..MotorsOff
