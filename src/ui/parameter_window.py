@@ -46,7 +46,7 @@ from protocol_enums import (
 from protocol_constants import FlightState, FLIGHT_STATE_NAMES
 from packet_parser import *
 from core.data_manager import data_manager
-from parameters import PARAMETER_DEFS, PARAM_DEFAULTS, PARAM_LIMITS, PARAM_TYPES, PARAM_DISPLAY_MULT, PARAM_SCALES, LEGACY_TAGS, PID_GAIN_TAGS, PARAM_BOOT_REQUIRED
+from parameters import PARAMETER_DEFS, PARAM_DEFAULTS, PARAM_LIMITS, PARAM_TYPES, PARAM_DISPLAY_MULT, PID_GAIN_TAGS, PARAM_BOOT_REQUIRED
 from airframes import airframes as af_module
 import workspace
 
@@ -469,7 +469,7 @@ class ParameterWindow(QMainWindow):
         int(ParamIndex.ALT_POS_KI):       (0.001, 0.005),
         int(ParamIndex.ALT_THROTTLE_COMP_LIMIT): (10.0, 25.0),   # mult 100 — mirrors FC pMaxAltHoldThrComp default 0.25 (aggressive end); min 10% = usable alt authority
         int(ParamIndex.ALT_ROC_KP):       (0.02, 1.5),       # fleet 0.05–1.0
-        int(ParamIndex.UNUSED_ALT_VEL_KI): (0.0003, 0.003),
+        int(ParamIndex.ALT_ROC_KI): (0.0003, 0.003),
         # Navigation
         int(ParamIndex.NAV_POS_KP):       (0.075, 0.3),
         int(ParamIndex.NAV_POS_KI):       (0.006, 0.025),
@@ -675,8 +675,8 @@ class ParameterWindow(QMainWindow):
         (ParamIndex.ALT_POS_KI, "Ki Alt", 0.0046),
         (ParamIndex.ALT_POS_INT_LIMIT, "I-Limit", 0.5),
         (ParamIndex.ALT_ROC_KP, "Kp ROC", 0.05),
-        (ParamIndex.UNUSED_ALT_VEL_KI, "Ki ROC", 0.001),
-        (ParamIndex.ALT_LPF, "Alt LPF (Hz)", 10),
+        (ParamIndex.ALT_ROC_KD, "Kd ROC", 0.000416),
+        (ParamIndex.ALT_ROC_KI, "Ki ROC", 0.001),
         (ParamIndex.ALT_HOLD_THR_COMP_DECAY_PERCENT_PS, "Thr Decay (%/s)", 25),
         (ParamIndex.ALT_THROTTLE_COMP_LIMIT, "Thr Comp Limit (%)", 25),
         (ParamIndex.AH_THROTTLE_MOVING_TRIGGER, "Thr Move Trig (%)", 2),
@@ -689,7 +689,7 @@ class ParameterWindow(QMainWindow):
         (ParamIndex.NAV_POS_KI, "Ki Pos", 0.012),
         (ParamIndex.NAV_POS_INT_LIM, "I-Limit (m/s)", 1.0),
         (ParamIndex.NAV_VEL_KP, "Kp Vel", 0.25),
-        (ParamIndex.NAV_POS_INT_LIMIT, "Max Vel (m/s)", 5),
+        (ParamIndex.NAV_MAX_VELOCITY, "Max Vel (m/s)", 5),
         (ParamIndex.NAV_MAX_ANGLE, "Max Angle (Deg)", 25),
         (ParamIndex.NAV_RTH_ALT, "RTH Alt (m)", 10),
         (ParamIndex.NAV_MAG_VAR, "Mag Var (Deg)", 12.8),
@@ -748,7 +748,6 @@ class ParameterWindow(QMainWindow):
         (ParamIndex.VOLT_SCALE, "Volt Scale", 19),
         (ParamIndex.CURRENT_SCALE, "Curr Scale", 0),
         (ParamIndex.BATTERY_CAPACITY, "Batt mAH", 1500),
-        (ParamIndex.THROTTLE_GAIN_RATE, "Thr Gain (%)", 0),
     ]
     
     FW_PARAMS = [
@@ -760,9 +759,9 @@ class ParameterWindow(QMainWindow):
         (ParamIndex.RUDDER_MOTOR_FF, "Rudder/Motor FF (%)", 0),
         (ParamIndex.FW_SPOILER_DECAY_PERCENT_PS, "Spoiler Decay (%/s)", 10),
         (ParamIndex.FW_AILERON_DIFFERENTIAL, "Aileron Diff (%)", 40),
-        (ParamIndex.FW_ROLL_AUTHORITY, "Roll Auth (%)", 25),
-        (ParamIndex.FW_PITCH_AUTHORITY, "Pitch Auth (%)", 25),
-        (ParamIndex.FW_YAW_AUTHORITY, "Yaw Auth (%)", 25),
+        (ParamIndex.FW_ROLL_AUTHORITY, "Roll Auth (%)", 100),
+        (ParamIndex.FW_PITCH_AUTHORITY, "Pitch Auth (%)", 100),
+        (ParamIndex.FW_YAW_AUTHORITY, "Yaw Auth (%)", 100),
         (ParamIndex.FW_BOARD_PITCH_ANGLE, "Board Pitch (Deg)", 0),
     ]
 
@@ -822,7 +821,6 @@ class ParameterWindow(QMainWindow):
         self.servo_sense_checks = []
         self._current_airframe_path = None
         self._airframe_limits: Dict[int, Tuple[float, float]] = {}  # .af [LIMITS] raw ranges
-        self._legacy_mode = False  # default OFF: unified raw float display (see legacy_check init)
         self._flash_airframe_name = None  # single source of truth: name from FC config flash
         self._generic_dir = os.path.join(os.path.dirname(__file__), '..', 'airframes', 'generic')
         self._user_dir = workspace.airframes_dir()
@@ -925,22 +923,26 @@ class ParameterWindow(QMainWindow):
         return PARAM_TYPES.get(idx, 'U8') == 'FLOAT'
 
     def _display_mult(self, idx: int) -> float:
-        """Effective display multiplier for a param index.
-
-        Normal mode:  raw * PARAM_DISPLAY_MULT[idx]
-        Legacy mode (for indices in LEGACY_TAGS):  raw / PARAM_SCALES[idx]
-        The write path divides by this same factor, so the raw float32
-        value sent to / read from the FC is identical in both modes.
-        """
-        if self._legacy_mode and idx in LEGACY_TAGS:
-            return 1.0 / PARAM_SCALES.get(idx, 1.0)
+        """Effective display multiplier for a param index: PARAM_DISPLAY_MULT[idx]."""
         return PARAM_DISPLAY_MULT.get(idx, 1.0)
 
     def _param_limits(self, idx: int) -> Tuple[float, float]:
-        """Effective raw (lo, hi) for a param — .af [LIMITS] range if present,
-        else the derived class ceiling from PARAM_LIMITS."""
-        return self._airframe_limits.get(idx,
-                                         PARAM_LIMITS.get(idx, (0.0, 255.0)))
+        """Effective raw (lo, hi) for a param: the ParamTable row, NARROWED by the
+        .af [LIMITS] band when that band is a genuine subset of it.
+
+        The [LIMITS] block is a display-only narrowing, so it may only ever
+        tighten the row. Returning the band un-intersected let an .af file widen
+        the spinbox past the FC's own clamp — the breach this table exists to
+        prevent. A band wider than the row, or one that does not overlap it at
+        all, is ignored: the row is what the FC stores.
+        """
+        row = PARAM_LIMITS.get(idx, (0.0, 255.0))
+        band = self._airframe_limits.get(idx)
+        if band is None:
+            return row
+        lo = max(row[0], band[0])
+        hi = min(row[1], band[1])
+        return (lo, hi) if lo <= hi else row
 
     def _min_decimals(self, idx: int, dec: int) -> int:
         """PID/gain terms (the 18 values across Roll/Pitch/Yaw/Alt/Nav) always
@@ -949,6 +951,16 @@ class ParameterWindow(QMainWindow):
         if idx in PID_GAIN_TAGS and dec < 4:
             return 4
         return dec
+
+    def _gain_step(self, idx: int, step: float, dec: int):
+        """Force the step to the display resolution on the PID/gain rows whose
+        _min_decimals floor exceeds the span/50 step: 0.02 arrows on a
+        0.0001-1.0 range cannot reach any intermediate value, so the step
+        becomes the last displayed decimal (0.0001)."""
+        min_dec = self._min_decimals(idx, dec)
+        if min_dec > dec:
+            step = 10 ** -min_dec
+        return step, min_dec
 
     def _resolve_combo_index(self, widget, value) -> int:
         """Return the combo index whose itemData == value, appending a marked
@@ -974,56 +986,6 @@ class ParameterWindow(QMainWindow):
         self._log(f"  ⚠️ Param value {int_value} not in combo data domain; "
                   f"appended '? Unknown ({int_value})' carrying the true value")
         return cb_idx
-
-    def _on_legacy_toggled(self, checked: bool):
-        self._legacy_mode = checked
-        self._refresh_legacy_display()
-
-    def _refresh_legacy_display(self):
-        """Re-apply display multiplier to all QDoubleSpinBox params in-place.
-
-        For each spinbox: read current value, divide by the OLD mult to
-        recover the raw float32, then set the new range and value using
-        the NEW (possibly legacy) mult.  The raw value is preserved.
-        """
-        if self._legacy_mode:
-            prev_mult_fn = lambda i: PARAM_DISPLAY_MULT.get(i, 1.0)
-        else:
-            prev_mult_fn = lambda i: (1.0 / PARAM_SCALES.get(i, 1.0)
-                                      if i in LEGACY_TAGS
-                                      else PARAM_DISPLAY_MULT.get(i, 1.0))
-        for idx, widget in self.params.items():
-            if not isinstance(widget, QDoubleSpinBox):
-                continue
-            try:
-                raw = widget.value() / prev_mult_fn(idx)
-            except (ZeroDivisionError, ValueError):
-                continue
-            new_mult = self._display_mult(idx)
-            limits = self._param_limits(idx)
-            lo = limits[0] * new_mult
-            hi = limits[1] * new_mult
-            span = hi - lo
-            step = max(0.001, span / 50.0)
-            if new_mult == 100:
-                step = 1.0
-            if idx in (68,) and step < 1.0:
-                step = 1.0
-            if idx in ONE_DECIMAL_LIMIT_TAGS:
-                step = 0.1
-            dec = max(0, min(6, -int(math.floor(math.log10(step)))))
-            # PID/gain terms: keep at least 4 decimals in every display mode
-            if idx in PID_GAIN_TAGS:
-                dec = max(dec, 4)
-            if new_mult not in (1.0, 100.0) and dec == 0 and step > 0.1:
-                step = 0.1
-                dec = 1
-            widget.blockSignals(True)
-            widget.setRange(lo, hi)
-            widget.setDecimals(dec)
-            widget.setSingleStep(step)
-            widget.setValue(max(lo, min(hi, raw * new_mult)))
-            widget.blockSignals(False)
 
     def update_params_from_typed(self, typed_data):
         """Update parameters from tag 17 packet — handles verify + normal update"""
@@ -1765,17 +1727,6 @@ class ParameterWindow(QMainWindow):
         self._advanced_checkbox.toggled.connect(self._on_advanced_toggled)
         advanced_row.addWidget(self._advanced_checkbox)
 
-        self.legacy_check = QCheckBox("Legacy")
-        self.legacy_check.setToolTip("Display legacy-tagged params as raw/scale (classic FC units)")
-        self.legacy_check.toggled.connect(self._on_legacy_toggled)
-        # Initial state mirrors __init__'s _legacy_mode (False = unified raw
-        # display). Widgets are already built in unified units via _display_mult,
-        # so set the visual state WITHOUT firing a redundant refresh (would
-        # double-convert when the user later toggles legacy on).
-        self.legacy_check.blockSignals(True)
-        self.legacy_check.setChecked(self._legacy_mode)
-        self.legacy_check.blockSignals(False)
-        advanced_row.addWidget(self.legacy_check)
         advanced_row.addStretch(1)
         self.param_layout.addLayout(advanced_row)
         
@@ -4347,7 +4298,14 @@ class ParameterWindow(QMainWindow):
         if idx_int in ONE_DECIMAL_LIMIT_TAGS:
             step = 0.1
             dec = 1
-        dec = self._min_decimals(idx_int, dec)
+        # Degree rows (radians displayed as degrees) step 0.5°; percent rows step 1%
+        if abs(mult - 57.29577951308231) < 1e-9:
+            step = 0.5
+            dec = max(dec, 1)
+        elif mult == 100:
+            step = 1.0
+            dec = max(dec, 0)
+        step, dec = self._gain_step(idx_int, step, dec)
         # Built-in default is expressed in unified (normal) display units;
         # project it through the classic scaling so the initial value matches
         # this box's (possibly legacy-scaled) range.  Untagged params are
@@ -4653,15 +4611,68 @@ class ParameterWindow(QMainWindow):
                 image.append(float(self._fc_readback_float[i]))
             else:
                 image.append(0.0)
-        return image
+        return self._clamp_image_to_rows(image)
+
+    @staticmethod
+    def _row_safe_value(idx: int, value: float) -> float:
+        """Return `value` as the FC could actually store it: finite, inside the
+        ParamTable row.
+
+        This is the single choke point for the "the GCS can never send the FC a
+        value outside its own bounds" guarantee. It matters because the row is
+        the FC's clamp: a value outside it would be silently substituted on
+        arrival, and the post-commit tag-71 comparison would then report a
+        mismatch as a WRITE alarm even though nothing was wrong with flash.
+        Non-finite values have no valid clamp at all (a NaN compares false
+        against both bounds), so they are replaced rather than clamped.
+        """
+        lo, hi = PARAM_LIMITS.get(idx, (0.0, 255.0))
+        try:
+            v = float(value)
+        except (TypeError, ValueError):
+            return min(max(0.0, lo), hi)
+        if not math.isfinite(v):
+            return min(max(0.0, lo), hi)
+        if v < lo:
+            return lo
+        if v > hi:
+            return hi
+        return v
+
+    def _clamp_image_to_rows(self, image: List[float]) -> List[float]:
+        """Force a whole commit image inside the ParamTable rows, reporting what
+        moved. A silent clamp would hide a real .af or estimator defect, so any
+        adjustment is logged; an unadjusted image logs nothing.
+        """
+        moved = []
+        out = []
+        for i, raw in enumerate(image):
+            v = self._row_safe_value(i, raw)
+            if not (v == raw):
+                moved.append((i, raw, v))
+            out.append(v)
+        if moved:
+            def fmt(x):
+                return "nan/inf" if not math.isfinite(float(x)) else ("%.7g" % x)
+            shown = ", ".join("%d: %s->%s" % (i, fmt(a), fmt(b))
+                              for i, a, b in moved[:8])
+            extra = "" if len(moved) <= 8 else " (+%d more)" % (len(moved) - 8)
+            self._log("  [!] Commit image forced inside ParamTable rows: %s%s"
+                      % (shown, extra))
+        return out
 
     def _apply_airframe_limits(self):
         """Re-apply spinbox ranges from the current .af [LIMITS] block (raw
-        limits × display mult), falling back to the class-ceiling PARAM_LIMITS
-        for tags without a [LIMITS] entry. If a loaded value already sits
-        outside the new range the bound is widened to contain it, never the
-        value silently clamped (setRange would otherwise inflate/deflate a
-        stale .af gain into the range — the Shadow 'way too high' trap).
+        limits × display mult), falling back to the ParamTable row for tags
+        without a [LIMITS] entry.
+
+        If a loaded value already sits outside that range the WIDGET bound is
+        widened to contain it, never the value silently clamped: setRange would
+        otherwise inflate/deflate a stale .af gain on display (the Shadow 'way
+        too high' trap). Widening is DISPLAY ONLY and confers no write authority
+        — build_raw_image() clamps the commit image to the ParamTable row and
+        logs whatever it moved, so a widened spinbox can never put a value
+        outside the FC's own clamp on the wire.
         """
         for idx, widget in self.params.items():
             if not isinstance(widget, QDoubleSpinBox):
@@ -4686,7 +4697,16 @@ class ParameterWindow(QMainWindow):
             if idx_int in (84, 85) and step > 0.01:
                 step = 0.01
                 dec = 2
-            dec = self._min_decimals(idx_int, dec)
+            if idx_int in ONE_DECIMAL_LIMIT_TAGS:
+                step = 0.1
+                dec = 1
+            if abs(mult - 57.29577951308231) < 1e-9:
+                step = 0.5
+                dec = max(dec, 1)
+            elif mult == 100:
+                step = 1.0
+                dec = max(dec, 0)
+            step, dec = self._gain_step(idx_int, step, dec)
             current = widget.value()
             if current < lo:
                 lo = current
@@ -4707,7 +4727,16 @@ class ParameterWindow(QMainWindow):
             if idx_int in (84, 85) and step > 0.01:
                 step = 0.01
                 dec = 2
-            dec = self._min_decimals(idx_int, dec)
+            if idx_int in ONE_DECIMAL_LIMIT_TAGS:
+                step = 0.1
+                dec = 1
+            if abs(mult - 57.29577951308231) < 1e-9:
+                step = 0.5
+                dec = max(dec, 1)
+            elif mult == 100:
+                step = 1.0
+                dec = max(dec, 0)
+            step, dec = self._gain_step(idx_int, step, dec)
             widget.blockSignals(True)
             widget.setRange(lo, hi)
             widget.setDecimals(dec)
@@ -4898,7 +4927,7 @@ class ParameterWindow(QMainWindow):
         self.reset_write_button()
         self.reset_read_button()
 
-        # Widen every spinbox to the class ceiling FIRST so no loaded value is
+        # Widen every spinbox to the ParamTable row FIRST so no loaded value is
         # clamped by the previous-load (stale) or factory range, THEN set
         # values, then narrow to the .af [LIMITS] tuning range (the shrink
         # guard in _apply_airframe_limits keeps any out-of-range stale value
@@ -4906,7 +4935,7 @@ class ParameterWindow(QMainWindow):
         self._airframe_limits = {}
         self._apply_airframe_limits()
         self._set_widgets_from_raw(raw_values)
-        # Apply .af [LIMITS] tuning ranges (fallback = class-ceiling PARAM_LIMITS)
+        # Apply .af [LIMITS] tuning ranges (fallback = the ParamTable row)
         self._airframe_limits = dict(meta.get('LIMITS', {}) or {})
         self._apply_airframe_limits()
         self.update_config_display()

@@ -29,25 +29,22 @@ class PacketTag(IntEnum):
     UNUSED_ENVIRONMENT = 11
     UNUSED_BEACON = 12
     # UAVX packets start at 13
+    # --- Flight / Nav / Control / RC / Config ---
     FLIGHT = 13
     NAV_UAVX = 14
     UNUSED_STATS = 15
     CONTROL = 16
-    PARAM = 17
     MIN = 18
     ORIGIN = 19
     WP = 20
     UNUSED_MISSION = 21
     RC_CHANNELS = 22
-
+    # --- Parameter block (write / readback / commit / image) ---
+    PARAM = 17
     PARAM_TAGGED_READ = 71
     PARAM_COMMIT = 72
-    TEST_REQUEST = 73
-    TEST_RESPONSE = 74
-    AFNAME_SET = 75
-    I2C_ERRORS = 76
     PARAM_IMAGE = 77
-    REBOOT = 78
+    # --- Miscellaneous / request-response ---
     REQUEST = 50
     ACK = 51
     MISC = 52
@@ -56,8 +53,14 @@ class PacketTag(IntEnum):
     UNUSED_INERTIAL = 55
     UNUSED_MINIMOSD = 56
     TUNING = 57
-    UNUSED_UKF = 58
+    META_REQ = 58
     GUIDANCE = 59
+    # --- Test / setup ---
+    TEST_REQUEST = 73
+    TEST_RESPONSE = 74
+    AFNAME_SET = 75
+    I2C_ERRORS = 76
+    REBOOT = 78
     UNUSED_ALTITUDE_CONTROL = 60
     UNUSED_SOARING = 61
     CALIBRATION = 62
@@ -744,18 +747,18 @@ class ParamIndex(IntEnum):
     SERVO_LPF_HZ = 26          # 27
     PITCH_RATE_KD = 27         # 28
     NAV_VEL_KP = 28            # 29
-    UNUSED_ALT_VEL_KP = 29     # 30
+    ALT_ROC_KD = 29            # 30
     HORIZON = 30               # 31
     MADGWICK_KP_MAG = 31       # 32
     NAV_RTH_ALT = 32           # 33
     NAV_MAG_VAR = 33           # 34
     UNUSED_SENSOR_HINT = 34    # 35
     ESC_TYPE = 35              # 36
-    RC_CHANNELS = 36           # 37
+    UNUSED_37 = 36             # 37
     RX_ROLL_CH = 37            # 38
     MADGWICK_KP_ACC = 38       # 39
     ROLL_CAM_TRIM = 39         # 40
-    NAV_POS_INT_LIMIT = 40     # 41
+    NAV_MAX_VELOCITY = 40      # 41
     RX_PITCH_CH = 41           # 42
     RX_YAW_CH = 42             # 43
     AF_TYPE = 43               # 44
@@ -772,7 +775,7 @@ class ParamIndex(IntEnum):
     RX_AUX2_CH = 54            # 55 - RCMap3
     RX_AUX3_CH = 55            # 56 - RCMap4
     NAV_POS_KP = 56            # 57
-    ALT_LPF = 57               # 58
+    UNUSED_58 = 57             # 58
     BALANCE = 58               # 59
     RX_AUX4_CH = 59            # 60 - RCMap5
     NAV_POS_KI = 60            # 61
@@ -807,7 +810,7 @@ class ParamIndex(IntEnum):
     ACC_LPF_SEL = 89           # 90
     YAW_RATE_KD = 90           # 91
     UNUSED_92 = 91             # 92
-    THROTTLE_GAIN_RATE = 92    # 93
+    UNUSED_93 = 92             # 93
     RX_AUX5_CH = 93            # 94 - RCMap6
     RX_AUX6_CH = 94            # 95 - RCMap7
     RX_AUX7_CH = 95            # 96 - RCMap8
@@ -816,15 +819,15 @@ class ParamIndex(IntEnum):
     YAW_ANGLE_Q_INT_LIMIT = 98   # 99
     ALT_POS_INT_LIMIT = 99     # 100
     MOTOR_STOP_SEL = 100       # 101
-    UNUSED_ALT_VEL_KI = 101    # 102
+    ALT_ROC_KI = 101           # 102
     ALT_THROTTLE_COMP_LIMIT = 102  # 103
     VRS_ROC = 103     # 104
     UNUSED_105 = 104           # 105
     AH_ROC_WINDOW_MPS = 105    # 106
     NAV_PROX_ALT_M = 106       # 107
     NAV_PROX_RADIUS_M = 107    # 108
-    YAW_RATE_KI = 108          # 109 — yaw rate-loop integral gain (heading hold)
-    YAW_RATE_INT_LIM = 109     # 110 — yaw rate-loop integral limit
+    UNUSED_109 = 108           # 109
+    UNUSED_110 = 109           # 110
     UNUSED_111 = 110          # 111 — was KFBaroVar (tracked live in state.c)
     UNUSED_112 = 111         # 112 — was KFAccUVar (tracked live in state.c)
     FW_THR_RAMP_PS = 112      # 113 — FW throttle re-open slew limit (%/s)

@@ -681,6 +681,76 @@ def parse_param_packet(data: bytes) -> Optional[ParameterData]:
     return p
 
 
+def parse_meta_packet(data: bytes) -> Optional[dict]:
+    """ParamTable metadata response (Tag=58), contract v2, v1 tolerated.
+
+    v2 body, one parameter per packet:
+        [meta_tag(1)] [version(1)] [tag(1)] [type(1)] [cls(1)] [boot(1)]
+        [labelLen(1)] [label(labelLen)] [min(4)] [max(4)] [default(4)] [scale(4)]
+    v2 digest reply (tag == 0xFF):
+        [meta_tag(1)] [version(1)] [0xFF] [0xEE] [4] [digest(4)]
+    v1 body (no version/cls/boot — an FC from before the v2 contract):
+        [meta_tag(1)] [tag(1)] [type(1)] [labelLen(1)] [label] [min..scale]
+
+    The label is the FC's ParamTable[].label, the single arbiter for a
+    parameter's identity (the GCS carries only a generated projection).
+    Both layouts are matched by exact length, so a v1 packet whose tag happens
+    to be 2 is not mistaken for a v2 one.
+    """
+    if len(data) < 4:
+        return None
+    meta_tag = extract_byte(data, 0)
+
+    if extract_byte(data, 1) == 2 and len(data) >= 7:
+        tag = extract_byte(data, 2)
+        if tag == 0xFF:
+            if len(data) == 9 and extract_byte(data, 3) == 0xEE:
+                return {
+                    'meta_tag': meta_tag,
+                    'version': 2,
+                    'param_idx': 0xFF,
+                    'digest': struct.unpack('<I', data[5:9])[0],
+                }
+        else:
+            base = 7 + extract_byte(data, 6)
+            if len(data) == base + 16:
+                name = data[7:base].decode('utf-8', errors='replace').rstrip('\x00')
+                (lo, hi, dflt, scale) = struct.unpack('<ffff', data[base:base + 16])
+                return {
+                    'meta_tag': meta_tag,
+                    'version': 2,
+                    'param_idx': tag,
+                    'type': extract_byte(data, 3),
+                    'cls': extract_byte(data, 4),
+                    'boot': extract_byte(data, 5),
+                    'name': name,
+                    'min': lo,
+                    'max': hi,
+                    'default': dflt,
+                    'scale': scale,
+                }
+
+    param_idx = extract_byte(data, 1)
+    ptype = extract_byte(data, 2)
+    name_len = extract_byte(data, 3)
+    base = 4 + name_len
+    if len(data) != base + 16:
+        return None
+    name = data[4:base].decode('utf-8', errors='replace').rstrip('\x00')
+    (lo, hi, dflt, scale) = struct.unpack('<ffff', data[base:base + 16])
+    return {
+        'meta_tag': meta_tag,
+        'version': 1,
+        'param_idx': param_idx,
+        'type': ptype,
+        'name': name,
+        'min': lo,
+        'max': hi,
+        'default': dflt,
+        'scale': scale,
+    }
+
+
 def parse_rc_packet(data: bytes) -> Optional[FlightData]:
     """Parse UAVXRCChannelsPacket (Tag=22)
     Body: frameInterval(2) + discovered(1) + flags(1) + controls u16 uS x 4

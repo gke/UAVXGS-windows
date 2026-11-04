@@ -12,6 +12,7 @@ import time
 import math
 import zlib
 from datetime import datetime
+from dataclasses import replace
 from typing import Optional
 
 from PyQt5.QtWidgets import *
@@ -31,7 +32,9 @@ from core.packet_logger import packet_logger
 from core.ack_handler import ack_handler
 
 from ui.parameter_window import ParameterWindow
-from parameters import PARAM_DISPLAY_MULT, PARAM_TYPES
+from parameters import (PARAM_DISPLAY_MULT, PARAM_TYPES,
+                        PARAMETER_DEFS, PARAM_LIMITS,
+                        PARAM_BOOT_REQUIRED, PARAM_META_DIGEST)
 import workspace
 from ui.nav_window import NavWindow
 from ui.calibration_window import CalibrationWindow
@@ -573,6 +576,22 @@ class MainWindow(QMainWindow):
         # Periodic tag-57 poll (~1 Hz) to keep the Identify window fresh.
         self._identify_poll_timer = QTimer(self)
         self._identify_poll_timer.timeout.connect(self._poll_tuning)
+
+        # Meta sweep (tag 58): on connect, request every ParamTable entry from
+        # the live FC and verify the generated schema against it. Read-only.
+        self._meta_sweep_idx = 0
+        self._meta_sweep_max = 0
+        self._meta_sweep_answered: set = set()
+        self._meta_sweep_drift = 0
+        self._meta_sweep_route = ""
+        self._meta_sweep_timer = QTimer(self)
+        self._meta_sweep_timer.timeout.connect(self._meta_sweep_tick)
+        # The digest is one request with a short deadline: no reply means an FC
+        # that predates the v2 record, and the full sweep is the fallback.
+        self._meta_digest_seen = False
+        self._meta_digest_timer = QTimer(self)
+        self._meta_digest_timer.setSingleShot(True)
+        self._meta_digest_timer.timeout.connect(self._meta_digest_timeout)
         
         self.setWindowTitle("UAVX Groundstation")
         self.setMinimumSize(1320, 990)
@@ -2121,10 +2140,13 @@ class MainWindow(QMainWindow):
             self.send_request(PacketTag.AFNAME, 0, 0, None)
             self.send_request(PacketTag.TUNING, 0, 0, None)
             self._identify_poll_timer.start(1000)
+            self._start_meta_sweep()
         else:
             self._in_flight = False
             self.raw_logger.stop()
             self._identify_poll_timer.stop()
+            self._meta_sweep_timer.stop()
+            self._meta_digest_timer.stop()
             self.connect_btn.setText("Connect")
             self.connect_btn.setStyleSheet("background-color: red; color: white; font-weight: bold;")
             self.status_label.setText("● Disconnected")
@@ -3318,14 +3340,167 @@ class MainWindow(QMainWindow):
                 packet_logger.log_received(71, "PARAM_TAGGED", parsed)
                 self._handle_param_packet(parsed)
 
+            case 58:
+                packet_logger.log_received(58, "META_REQ", parsed)
+                # parse_packet hands every parse_* function the BODY. Handing
+                # this one the whole frame made parse_meta_packet read the SOH
+                # (0x01) as the meta tag, fail its length test and return None,
+                # so the import path was inert while looking wired. Reaching
+                # this arm means data[0] == SOH and the u16 length is in range,
+                # so the slice needs no further guard.
+                self._on_meta_packet(data[4:4 + extract_short(data, 2)])
+
             case _:
                 packet_logger.log_received(tag, f"TAG{tag}", parsed)
 
         MISC_TAGS = {15, 21, 50, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 64, 65, 67, 68, 74, 76}
         if tag in MISC_TAGS and self.misc_window and self.misc_window.isVisible():
-            body = data[3:3+data[2]] if len(data) > 3 and data[0] == 0x01 else data
+            body = data[4:4 + extract_short(data, 2)]
             self.misc_window.add_packet(tag, parsed if parsed is not None else body, "R")
     
+    def _start_meta_sweep(self):
+        """Ask for the FC's schema digest first: one packet says whether the
+        generated projection is current, and the 128-tag sweep only runs when it
+        is not (or when the FC predates the v2 contract and cannot answer)."""
+        self._meta_sweep_timer.stop()
+        self._meta_sweep_idx = 0
+        self._meta_sweep_max = max(PARAMETER_DEFS) + 1
+        self._meta_sweep_answered = set()
+        self._meta_sweep_drift = 0
+        self._meta_sweep_route = ""
+        self._meta_digest_seen = False
+        self.send_request(PacketTag.REQUEST, PacketTag.META_REQ, 0xFF, 0)
+        self._meta_digest_timer.start(600)
+
+    def _on_meta_digest(self, digest):
+        self._meta_digest_timer.stop()
+        self._meta_digest_seen = True
+        if digest == PARAM_META_DIGEST:
+            self.log_debug(
+                f"param metadata: schema digest 0x{digest:08X} matches the FC - "
+                f"nothing to import", "Info")
+        else:
+            self.log_debug(
+                f"param metadata: schema digest differs (GCS 0x{PARAM_META_DIGEST:08X} "
+                f"vs FC 0x{digest:08X}) - importing the live ParamTable", "Warnings")
+            self._begin_meta_sweep("digest mismatch")
+
+    def _meta_digest_timeout(self):
+        if self._meta_digest_seen or not self.connected:
+            return
+        self.log_debug(
+            "param metadata: no digest reply within 600 ms - the FC either "
+            "predates contract v2 or the reply was lost; sweeping all tags", "Info")
+        self._begin_meta_sweep("digest unanswered")
+
+    def _begin_meta_sweep(self, route):
+        self._meta_sweep_route = route
+        self._meta_sweep_idx = 0
+        self._meta_sweep_timer.start(40)
+
+    def _meta_sweep_tick(self):
+        if not self.connected:
+            self._meta_sweep_timer.stop()
+            return
+        if self._meta_sweep_idx >= self._meta_sweep_max:
+            self._meta_sweep_finalise()
+            return
+        self.send_request(PacketTag.REQUEST, PacketTag.META_REQ,
+                          self._meta_sweep_idx, 0)
+        self._meta_sweep_idx += 1
+
+    def _meta_sweep_finalise(self):
+        self._meta_sweep_timer.stop()
+        n = self._meta_sweep_max
+        route = self._meta_sweep_route or "unspecified route"
+        unanswered = [i for i in range(n) if i not in self._meta_sweep_answered]
+        if unanswered:
+            preview = ", ".join(str(i) for i in unanswered[:12])
+            self._trace(
+                f"⚠ param metadata: {len(unanswered)}/{n} tag(s) unanswered "
+                f"after {route} (first: {preview})", "Errors")
+        else:
+            # _trace, not log_debug: the status bar line is transient and the
+            # very next tag overwrites it, so a drift would be visible for one
+            # frame only. stdout survives for post-mortem, needs no new widget,
+            # no dialog and no latch. Silent when the digest matched - a clean
+            # connect never sweeps, so this never fires on the good path.
+            self._trace(
+                f"param metadata: {n} tags verified after {route}, "
+                f"{self._meta_sweep_drift} drift(s)", "Info")
+        if self._meta_sweep_drift and self.param_window is not None:
+            # The adopted PARAM_LIMITS only reach the widgets through this -
+            # otherwise a drifted bound is a number in a table and nothing more.
+            self.param_window._apply_airframe_limits()
+            self.log_debug(
+                "param metadata: adopted FC name/limits/boot flags and refreshed "
+                "the spinbox ranges - regenerate parameters.py to silence this "
+                "(scripts/generate_params_from_fc.py --gen-gcs)", "Warnings")
+
+    def _on_meta_packet(self, body: bytes):
+        """Tag-58 response body: verify the generated schema against the live FC
+        ParamTable (the single arbiter), then adopt what drifted. The FC wins
+        at runtime; every drift is an Error trace so the GCS copy gets
+        regenerated.
+
+        `body` is the packet body, exactly as parse_packet passes it to every
+        other parse_* function - NOT the framed packet. The v2 contract begins
+        at the meta tag, so a frame would shift every field by four bytes.
+        """
+        from packet_parser import parse_meta_packet
+        meta = parse_meta_packet(body)
+        if not meta:
+            return
+        idx = meta.get("param_idx")
+        if idx == 0xFF:
+            self._on_meta_digest(meta.get("digest"))
+            return
+        if idx is None or idx not in PARAMETER_DEFS or idx not in PARAM_LIMITS:
+            return
+        self._meta_sweep_answered.add(idx)
+
+        def _close(w, g):
+            tol = 1e-4 * max(1.0, abs(g))
+            return abs(w - g) <= tol
+
+        issues = []
+        wname = meta.get("name") or ""
+        gname = PARAMETER_DEFS[idx].name
+        if wname != gname:
+            issues.append(f"name '{gname}' -> '{wname}'")
+
+        glo, ghi = PARAM_LIMITS[idx]
+        wlo = meta.get("min", glo)
+        whi = meta.get("max", ghi)
+        if not (_close(wlo, glo) and _close(whi, ghi)):
+            issues.append(f"limits ({glo}, {ghi}) -> ({wlo}, {whi})")
+
+        wtype = meta.get("type")
+        if wtype is not None:
+            gtype = "FLOAT" if PARAM_TYPES.get(idx) == "FLOAT" else "U8"
+            if (wtype == 3) != (gtype == "FLOAT"):
+                issues.append(f"type {gtype} -> {'FLOAT' if wtype == 3 else 'U8'}")
+
+        wboot = meta.get("boot")
+        if wboot is not None and bool(wboot) != (idx in PARAM_BOOT_REQUIRED):
+            issues.append(
+                f"boot-scoped {idx in PARAM_BOOT_REQUIRED} -> {bool(wboot)}")
+            if wboot:
+                PARAM_BOOT_REQUIRED.add(idx)
+            else:
+                PARAM_BOOT_REQUIRED.discard(idx)
+
+        if issues:
+            self._meta_sweep_drift += 1
+            for issue in issues:
+                self.log_debug(f"⚠ schema drift tag {idx}: {issue}", "Errors")
+
+        # Parameter is a frozen dataclass: rebind the slot, never mutate the field
+        # (in-place assignment raises FrozenInstanceError inside a Qt slot, which
+        # PyQt escalates to qFatal).
+        PARAMETER_DEFS[idx] = replace(PARAMETER_DEFS[idx], name=wname)
+        PARAM_LIMITS[idx] = (wlo, whi)
+
     def update_config_colors(self):
         """Update config bit display based on current parameters"""
         config1 = self.config1_cache
