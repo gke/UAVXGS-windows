@@ -1278,37 +1278,36 @@ def parse_calibration_packet(data: bytes) -> Optional[dict]:
 
 
 def parse_serial_ports_packet(data: bytes) -> Optional[dict]:
-    """Parse UAVXSerialPortsPacket (Tag=66) - from telem.c SendSerialPortStatus()
-    Body: numPorts(1) + bufSize(2)
-          + telemetry_flags(1) + telemetry_tx(2) + telemetry_rx(2)
-          + gps_flags(1) + gps_tx(2) + gps_rx(2)
-          + uart4_sr(2)
-          = 15 bytes
-    """
-    if len(data) < 13:
+    """Parse UAVXSerialPortsPacket (Tag=66) from telem.c SendSerialPortStatus()."""
+    if len(data) < 3:
         return None
 
-    def _port(name: str, off: int):
-        flags = extract_byte(data, off)
-        return {
-            'name': name,
-            'tx_overflow': bool(flags & 2),
-            'rx_overflow': bool(flags & 1),
-            'tx_q': extract_short(data, off + 1),
-            'rx_q': extract_short(data, off + 3),
-        }
+    numPorts = extract_byte(data, 0)
+    bufferSize = extract_short(data, 1)
+
+    if numPorts == 0 or len(data) < 3 + 9 * numPorts:
+        return None
 
     d = {
-        'num_ports': extract_byte(data, 0),
-        'buffer_size': extract_short(data, 1),
-        'telemetry': _port('Telemetry', 3),
-        'gps': _port('GPS', 8),
+        'num_ports': numPorts,
+        'buffer_size': bufferSize,
+        'ports': [],
     }
 
-    if len(data) >= 15:
-        d['uart4_sr'] = extract_short(data, 13)
-    else:
-        d['uart4_sr'] = None
+    off = 3
+    for i in range(numPorts):
+        flags = extract_byte(data, off + 1)
+        d['ports'].append({
+            'index': i,
+            'id': extract_byte(data, off),
+            'tx_overflow': bool(flags & 2),
+            'rx_overflow': bool(flags & 1),
+            'tx_q': extract_short(data, off + 2),
+            'rx_q': extract_short(data, off + 4),
+            'baud': extract_short(data, off + 6) * 100,
+            'usart_sr': extract_byte(data, off + 8),
+        })
+        off += 9
 
     return d
 

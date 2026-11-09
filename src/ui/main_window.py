@@ -22,7 +22,7 @@ from PyQt5.QtGui import *
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from protocol_constants import *
-from protocol_enums import PacketTag, ParamIndex, FlightState, NavState, Config1Bits, Config2Bits, MiscCommand, AirframeType
+from protocol_enums import PacketTag, ParamIndex, FlightState, NavState, Config1Bits, Config2Bits, MiscCommand, AirframeType, SerialPort
 from packet_parser import *
 from widgets.attitude_indicator import AttitudeIndicator, ExecTimeBar
 from widgets.anomaly_box import AnomalyBox
@@ -188,10 +188,10 @@ FLAG_BIT_DEFS = {
     79: ('gps_hdg', 'GPSHdg', 'Valid GPS Heading'),
     80: ('bad_bus', 'BadBus', 'Bad Bus Device Config'),
     81: ('dive_mode', 'Dive', 'Dive Mode'),
-    82: ('test_active', 'TestActive', 'Test Active'),
+    82: ('test_mission', 'TestMission', 'Test Mission Enabled'),
     83: ('mag_yaw_disagree', 'YawDrift', 'Mag/Yaw Disagreement'),
-    84: ('unused84', 'unused84', 'Reserved'),
-    85: ('unused85', 'unused85', 'Reserved'),
+    84: ('gps_proto_ubx', 'GPSPktUBX', 'UBX Protocol Active'),
+    85: ('gps_proto_nmea', 'GPSPktNMEA', 'NMEA Protocol Active'),
     86: ('unused86', 'unused86', 'Reserved'),
     87: ('unused87', 'unused87', 'Reserved'),
     88: ('unused88', 'unused88', 'Reserved'),
@@ -212,6 +212,7 @@ FLAG_GROUPS = [
     ('RTH / Landing', [20, 72, 45, 3, 30]),
     ('Origin / Home', [7, 28, 78]),
     ('GPS', [6, 52, 79]),
+    ('GPS Protocols', [84, 85]),
     ('Sensors / Health', [47, 8, 10, 44, 41, 76, 55, 22, 83]),
     ('RC & Input', [35, 53, 75, 58, 77, 81]),
     ('Soaring / Glide', [51, 63, 69]),
@@ -1328,7 +1329,7 @@ class MainWindow(QMainWindow):
         self.gps_sacc = QLabel("---")
         self.gps_cacc = QLabel("---")
         self.gps_rate_label = QLabel("---")
-        
+
         for lbl in (self.gps_lat, self.gps_lon, self.gps_alt, self.gps_vel, self.gps_hacc,
                      self.gps_vacc, self.gps_sacc, self.gps_cacc):
             lbl.setStyleSheet("color: #e74c3c;")
@@ -1360,6 +1361,8 @@ class MainWindow(QMainWindow):
 
         gps_layout.addWidget(QLabel("cAcc:"), 5, 0)
         gps_layout.addWidget(self.gps_cacc, 5, 1)
+
+
 
         fm = self.gps_lat.fontMetrics()
         w_latlon = fm.horizontalAdvance("-123.456789") + 4
@@ -1404,37 +1407,15 @@ class MainWindow(QMainWindow):
         link_layout.addWidget(self.link_failsafes, 2, 1)
         link_box.setLayout(link_layout)
         
-        # Serial Ports (side-by-side with Link Stats)
+        # Serial Ports — per-port grid: name, live baud, USART SR, TX/RX queued bytes
         serial_box = QGroupBox("Serial Ports")
         serial_box.setStyleSheet("QGroupBox { font-weight: bold; border: 1px solid black; border-radius: 4px; margin-top: 6px; } QGroupBox::title { subcontrol-origin: margin; left: 6px; padding: 0 3px 0 3px; }")
-        serial_layout = QGridLayout()
-        serial_layout.setVerticalSpacing(1)
-        serial_layout.setHorizontalSpacing(4)
-        serial_layout.addWidget(QLabel(""), 0, 0)
-        serial_layout.addWidget(QLabel("TX"), 0, 1)
-        serial_layout.addWidget(QLabel("RX"), 0, 2)
-        serial_layout.addWidget(QLabel("Ov"), 0, 3)
-        bar_style = """
-            QProgressBar { border: 1px solid #555; border-radius: 3px; text-align: center; height: 14px; font-size: 9px; }
-            QProgressBar::chunk { background: #3498db; border-radius: 2px; }
-        """
-        self.ser_telem_tx = QProgressBar(); self.ser_telem_tx.setStyleSheet(bar_style); self.ser_telem_tx.setRange(0, 512); self.ser_telem_tx.setValue(0); self.ser_telem_tx.setTextVisible(True)
-        self.ser_telem_rx = QProgressBar(); self.ser_telem_rx.setStyleSheet(bar_style); self.ser_telem_rx.setRange(0, 512); self.ser_telem_rx.setValue(0); self.ser_telem_rx.setTextVisible(True)
-        self.ser_telem_ov = QLabel("--")
-        self.ser_gps_tx = QProgressBar(); self.ser_gps_tx.setStyleSheet(bar_style); self.ser_gps_tx.setRange(0, 512); self.ser_gps_tx.setValue(0); self.ser_gps_tx.setTextVisible(True)
-        self.ser_gps_rx = QProgressBar(); self.ser_gps_rx.setStyleSheet(bar_style); self.ser_gps_rx.setRange(0, 512); self.ser_gps_rx.setValue(0); self.ser_gps_rx.setTextVisible(True)
-        self.ser_gps_ov = QLabel("--")
-        for ov in (self.ser_telem_ov, self.ser_gps_ov):
-            ov.setStyleSheet("font-weight: bold;")
-        serial_layout.addWidget(QLabel("Telem:"), 1, 0)
-        serial_layout.addWidget(self.ser_telem_tx, 1, 1)
-        serial_layout.addWidget(self.ser_telem_rx, 1, 2)
-        serial_layout.addWidget(self.ser_telem_ov, 1, 3)
-        serial_layout.addWidget(QLabel("GPS:"), 2, 0)
-        serial_layout.addWidget(self.ser_gps_tx, 2, 1)
-        serial_layout.addWidget(self.ser_gps_rx, 2, 2)
-        serial_layout.addWidget(self.ser_gps_ov, 2, 3)
-        serial_box.setLayout(serial_layout)
+        self.serial_layout = QGridLayout()
+        self.serial_layout.setVerticalSpacing(1)
+        self.serial_layout.setHorizontalSpacing(8)
+        # header row removed — no "Port | Baud | SR | TX/RX q | Ovfl" line
+        self._serial_widgets: dict[int, dict] = {}  # per-port widget dicts
+        serial_box.setLayout(self.serial_layout)
         
         link_serial_row = QHBoxLayout()
         link_serial_row.setSpacing(5)
@@ -3228,7 +3209,7 @@ class MainWindow(QMainWindow):
 
             case 66:
                 packet_logger.log_received(66, "SERIAL", parsed)
-                if isinstance(parsed, dict) and 'telemetry' in parsed:
+                if isinstance(parsed, dict) and 'ports' in parsed:
                     self.serial_ports = parsed
                     self.update_serial_ports_display()
 
@@ -3878,6 +3859,7 @@ class MainWindow(QMainWindow):
             self.gps_vacc.setText(f"{f.gps_vacc:.1f}")
             self.gps_sacc.setText(f"{f.gps_sacc:.1f}")
             self.gps_cacc.setText(f"{f.gps_cacc:.1f}")
+
             color = "#27ae60" if gps_valid else "#e74c3c"
             self.gps_lat.setStyleSheet(f"color: {color}; font-weight: bold;")
             self.gps_lon.setStyleSheet(f"color: {color}; font-weight: bold;")
@@ -4037,31 +4019,138 @@ class MainWindow(QMainWindow):
             for bar in self.control_bars:
                 bar.setValue(0)
 
+    def _clear_serial_rows(self):
+        for w in self._serial_widgets.values():
+            for key in ('name', 'baud', 'flags', 'queue', 'ovfl'):
+                lbl = w.get(key)
+                if lbl is not None:
+                    self.serial_layout.removeWidget(lbl)
+                    lbl.deleteLater()
+        self._serial_widgets.clear()
+
+    def _build_serial_rows(self, ports):
+        for i, p in enumerate(ports):
+            port_id = p.get('id', i)
+            try:
+                port_name = SerialPort(port_id).name
+            except ValueError:
+                port_name = f"P{i + 1}"
+            name_lbl = QLabel(port_name)
+            name_lbl.setStyleSheet("font-size: 12px;")
+            baud_lbl = QLabel("--")
+            baud_lbl.setStyleSheet("font-size: 12px;")
+            flags_lbl = QLabel("--")
+            flags_lbl.setStyleSheet("font-size: 12px; font-family: monospace; font-weight: bold;")
+            queue_lbl = QLabel("-- / --")
+            queue_lbl.setStyleSheet("font-size: 12px; font-family: monospace;")
+            ovfl_lbl = QLabel("--")
+            ovfl_lbl.setStyleSheet("font-size: 12px; font-family: monospace; font-weight: bold;")
+            self.serial_layout.addWidget(name_lbl, i + 1, 0)
+            self.serial_layout.addWidget(baud_lbl, i + 1, 1)
+            self.serial_layout.addWidget(flags_lbl, i + 1, 2)
+            self.serial_layout.addWidget(queue_lbl, i + 1, 3)
+            self.serial_layout.addWidget(ovfl_lbl, i + 1, 4)
+            self._serial_widgets[i] = {
+                'index': i, 'name': name_lbl, 'baud': baud_lbl,
+                'flags': flags_lbl, 'queue': queue_lbl, 'ovfl': ovfl_lbl,
+            }
+
     def update_serial_ports_display(self):
-        if not self.serial_ports:
+        if not self.serial_ports or not self.serial_ports.get('ports'):
             return
-        buf_size = self.serial_ports.get('buffer_size', 512)
-        def _set(port_key, tx_bar, rx_bar, ov_lbl):
-            p = self.serial_ports.get(port_key)
-            if not p:
-                return
-            tx_bar.setRange(0, buf_size)
-            tx_bar.setValue(p['tx_q'])
-            tx_bar.setFormat(f"{p['tx_q']}")
-            rx_bar.setRange(0, buf_size)
-            rx_bar.setValue(p['rx_q'])
-            rx_bar.setFormat(f"{p['rx_q']}")
-            ov = []
-            if p['tx_overflow']: ov.append("TX")
-            if p['rx_overflow']: ov.append("RX")
-            if ov:
-                ov_lbl.setText("/".join(ov))
-                ov_lbl.setStyleSheet("font-weight: bold; color: #e74c3c;")
-            else:
-                ov_lbl.setText("--")
-                ov_lbl.setStyleSheet("font-weight: bold;")
-        _set('telemetry', self.ser_telem_tx, self.ser_telem_rx, self.ser_telem_ov)
-        _set('gps', self.ser_gps_tx, self.ser_gps_rx, self.ser_gps_ov)
+        ports = self.serial_ports['ports']
+
+        if len(self._serial_widgets) != len(ports):
+            self._clear_serial_rows()
+            self._build_serial_rows(ports)
+
+        for i, p in enumerate(ports):
+            self._update_port(i, p, self.serial_ports.get('buffer_size', 512))
+
+    def _update_port(self, index, p, buf):
+        """Refresh a single serial-port row given a parsed port dict from parser."""
+        w = self._serial_widgets.get(index)
+        if w is None:
+            return
+
+        port_id = p.get('id', index)
+        try:
+            port_name = SerialPort(port_id).name
+        except ValueError:
+            port_name = f"P{index + 1}"
+
+        baud = p.get('baud', 0)
+        if baud <= 0:
+            baud_text = "\u2014"
+            baud_tip = ("No baud reported: the FC never initialised this port, "
+                        "so SerialLiveBaud is 0")
+        elif baud >= 1000:
+            baud_text = f"{baud * 0.001:.1f}k"
+            baud_tip = f"Live baud rate reported by the FC ({baud} bps)"
+        else:
+            baud_text = str(baud)
+            baud_tip = f"Live baud rate reported by the FC ({baud} bps)"
+
+        if port_id == SerialPort.USB:
+            sr_text = "\u2014"
+            sr_tip = "USB VCP link - no USART, no status register, no baud rate"
+            if baud <= 0:
+                baud_tip = "USB VCP link - a baud rate does not apply"
+        else:
+            sr_text = f"{p.get('usart_sr', 0):08b}"
+            sr_tip = ("USART status register, binary, bit 7 (left) to bit 0 (right):\n"
+                      "7=TXE  6=TC  5=RXNE  4=IDLE  3=ORE  2=NF  1=FE  0=PE\n"
+                      "ORE = overrun, FE = framing, NF = noise, PE = parity.\n"
+                      "A healthy idle UART reads 11000000 (TXE and TC set).")
+
+        tx_ovfl = bool(p.get('tx_overflow', False))
+        rx_ovfl = bool(p.get('rx_overflow', False))
+        if tx_ovfl and rx_ovfl:
+            ovfl_text = "TX+RX"
+        elif tx_ovfl:
+            ovfl_text = "TX"
+        elif rx_ovfl:
+            ovfl_text = "RX"
+        else:
+            ovfl_text = "OK"
+        ovfl_latched = tx_ovfl or rx_ovfl
+        ovfl_colour = "#c62828" if ovfl_latched else "#2e7d32"
+        ovfl_tip = (
+            "Sticky ring-buffer overflow, set by the FC and cleared only by an "
+            "FC reboot.\n"
+            "OK (green) = neither ring has ever overflowed.\n"
+            "TX (red) = the FC's transmit ring filled and a byte was dropped.\n"
+            "RX (red) = the receive ring filled and a byte was lost.")
+
+        tx_q = p.get('tx_q', 0)
+        rx_q = p.get('rx_q', 0)
+
+        queue_tip = (
+            f"TX / RX ring occupancy, in bytes, at the instant the FC "
+            f"answered the status request (ring size {buf} bytes).\n"
+            "TX is bytes queued and still waiting for the DMA (or, on USB, "
+            "for the host to drain), so it reads 0-2 in normal operation.\n"
+            "RX is bytes received and not yet parsed. A sustained high value "
+            "means the port cannot keep up with its device; TX near the ring "
+            "size means the link is not draining at all.")
+        if port_id == SerialPort.USB:
+            queue_tip += ("\nThe USB VCP link is polled directly, so its RX "
+                          "ring is not used and RX always reads 0.")
+
+        w['name'].setText(port_name)
+        w['baud'].setText(baud_text)
+        w['flags'].setText(sr_text)
+        w['queue'].setText(f"{tx_q} / {rx_q}")
+        w['ovfl'].setText(ovfl_text)
+        w['ovfl'].setStyleSheet(
+            f"font-size: 9px; font-family: monospace; font-weight: bold; "
+            f"color: {ovfl_colour};")
+
+        w['name'].setToolTip(f"Serial port id {port_id} ({port_name})")
+        w['baud'].setToolTip(baud_tip)
+        w['flags'].setToolTip(sr_tip)
+        w['queue'].setToolTip(queue_tip)
+        w['ovfl'].setToolTip(ovfl_tip)
 
     def check_connection(self):
         now = time.monotonic()
