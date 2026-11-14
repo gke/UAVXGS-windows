@@ -182,7 +182,7 @@ FLAG_BIT_DEFS = {
     73: ('unused73', 'unused73', 'Reserved'),
     74: ('drive_sym', 'DriveSym', 'Enforce Drive Symmetry'),
     75: ('rssi', 'RSSI', 'RSSI (< -90 dBm)'),
-    76: ('ext_mag', 'ExtMag', 'External Mag Detected'),
+    76: ('ext_mag', 'ExtMag', 'Using External Mag (Config1 bit 0) — selects the external mag and its axis flip'),
     77: ('snr', 'SNR', 'SNR Low (< -10 dB)'),
     78: ('offset_home', 'OffsetHome', 'Using Offset Home'),
     79: ('gps_hdg', 'GPSHdg', 'Valid GPS Heading'),
@@ -190,8 +190,9 @@ FLAG_BIT_DEFS = {
     81: ('dive_mode', 'Dive', 'Dive Mode'),
     82: ('test_mission', 'TestMission', 'Test Mission Enabled'),
     83: ('mag_yaw_disagree', 'YawDrift', 'Mag/Yaw Disagreement'),
-    84: ('unused84', 'unused84', 'Reserved'),
-    85: ('unused85', 'unused85', 'Reserved'),
+    84: ('gps_absent', 'NoGPS', 'No GPS receiver detected (port not wired, or nothing ever received on it)'),
+    # 85 = GPSActive: live UBX-frame-flowing flag, cleared by the nav timeout.
+    85: ('gps_active', 'GPSActive', 'UBX frames flowing (live; clears ~2 s after the last valid sentence)'),
     86: ('unused86', 'unused86', 'Reserved'),
     87: ('unused87', 'unused87', 'Reserved'),
     88: ('unused88', 'unused88', 'Reserved'),
@@ -211,7 +212,7 @@ FLAG_GROUPS = [
     ('Navigation', [15, 36, 16, 17, 18, 19, 24, 70]),
     ('RTH / Landing', [20, 72, 45, 3, 30]),
     ('Origin / Home', [7, 28, 78]),
-    ('GPS', [6, 52, 79]),
+    ('GPS', [6, 52, 79, 57, 84, 85]),
     ('Sensors / Health', [47, 8, 10, 44, 41, 76, 55, 22, 83]),
     ('RC & Input', [35, 53, 75, 58, 77, 81]),
     ('Soaring / Glide', [51, 63, 69]),
@@ -480,6 +481,8 @@ class MainWindow(QMainWindow):
         self.config_labels = []
         self.config1_cache = 0
         self.config2_cache = 0
+        self._gps_absent = None
+        self._gps_absent_reports = 0
         
         self.param_window: Optional[ParameterWindow] = None
         self._pending_params = None
@@ -546,11 +549,14 @@ class MainWindow(QMainWindow):
         self._last_tune = None
         self._last_rx_time = 0.0
         self._pf_term_mask = 0
+        self._last_fc_state = None
         self._log_level = "All"
         self._flight_log_only = False  # terminal: show only FLIGHT packets
         self._trace_combo_loading = False
         self._trace_fc_value = None
         self._trace_write_pending = None
+        self._gps_ubx_relay_on = False
+        self._gps_ubx_relay_desired = False
 
         self.setup_ui()
         self.setup_menu()
@@ -847,6 +853,16 @@ class MainWindow(QMainWindow):
         self.esc_btn.setStyleSheet("font-weight: bold; color: #e67e22;")
         toolbar.addWidget(self.esc_btn)
 
+        self.ubx_relay_btn = QPushButton("UBX")
+        self.ubx_relay_btn.setToolTip(
+            "GPS UBX raw-sentence relay (RAM-only; the FC resets it OFF on "
+            "reboot). Streams the first 64 bytes of each UBX sentence on "
+            "tag 80 for in-GCS decoding — for diagnosing a silent GPS. "
+            "Orange = off, red = on.")
+        self.ubx_relay_btn.setFixedWidth(80)
+        self.ubx_relay_btn.setStyleSheet("font-weight: bold; color: #e67e22;")
+        toolbar.addWidget(self.ubx_relay_btn)
+
         # Trace/Replay buttons hidden for now (redundant)
         self.replay_btn = QPushButton("Replay")
         self.replay_btn.setToolTip("Replay a raw telemetry log (Ctrl+R)")
@@ -1053,6 +1069,11 @@ class MainWindow(QMainWindow):
         self.pf_block_label.setStyleSheet("color: #cc0000; font-weight: bold;")
         self.pf_block_label.setVisible(False)
         state_layout.addWidget(self.pf_block_label, 2, 0, 1, 4)
+        self.nav_no_gps_label = QLabel("")
+        self.nav_no_gps_label.setWordWrap(True)
+        self.nav_no_gps_label.setStyleSheet("color: #b8860b; font-weight: bold;")
+        self.nav_no_gps_label.setVisible(False)
+        state_layout.addWidget(self.nav_no_gps_label, 3, 0, 1, 4)
         state_box.setLayout(state_layout)
         state_batt_row.addWidget(state_box)
         
@@ -1361,7 +1382,20 @@ class MainWindow(QMainWindow):
         gps_layout.addWidget(QLabel("cAcc:"), 5, 0)
         gps_layout.addWidget(self.gps_cacc, 5, 1)
 
-
+        self.gps_rx_bytes = QLabel("---")
+        self.gps_rx_packets = QLabel("---")
+        self.gps_rx_drops = QLabel("---")
+        self.gps_rx_note = QLabel("")
+        self.gps_rx_note.setStyleSheet("font-weight: bold; color: #e74c3c;")
+        for lbl in (self.gps_rx_bytes, self.gps_rx_packets, self.gps_rx_drops):
+            lbl.setStyleSheet("font-weight: bold;")
+        gps_layout.addWidget(QLabel("RX:"), 6, 0)
+        gps_layout.addWidget(self.gps_rx_bytes, 6, 1)
+        gps_layout.addWidget(QLabel("Pkts:"), 6, 2)
+        gps_layout.addWidget(self.gps_rx_packets, 6, 3)
+        gps_layout.addWidget(QLabel("Drops:"), 7, 0)
+        gps_layout.addWidget(self.gps_rx_drops, 7, 1)
+        gps_layout.addWidget(self.gps_rx_note, 7, 2, 1, 2)
 
         fm = self.gps_lat.fontMetrics()
         w_latlon = fm.horizontalAdvance("-123.456789") + 4
@@ -1371,12 +1405,16 @@ class MainWindow(QMainWindow):
             lbl.setMinimumWidth(w_latlon)
         for lbl in (self.gps_alt, self.gps_vel, self.gps_sats, self.gps_fix,
                     self.gps_hacc, self.gps_sacc, self.gps_vacc, self.gps_cacc,
-                    self.gps_rate_label):
+                    self.gps_rate_label, self.gps_rx_bytes, self.gps_rx_packets,
+                    self.gps_rx_drops):
             lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
             lbl.setMinimumWidth(w_num)
 
         gps_box.setLayout(gps_layout)
         nav_gps_row.addWidget(gps_box)
+
+        self.nav_box = nav_box
+        self.gps_box = gps_box
 
         right_panel.addLayout(nav_gps_row)
         
@@ -1476,9 +1514,9 @@ class MainWindow(QMainWindow):
         
         self.config_labels = []
         self.config_flags = [
-            (1, 0, "Ext Mag"), (1, 1, "Autoland"), (1, 2, "Use Mag"), (1, 3, "Emulation"),
+            (1, 0, "Ext Mag"), (1, 1, "Autoland"), (1, 3, "Emulation"),
             (1, 4, "AH Alarm"), (1, 5, "GPS Alt"), (1, 7, "Clamp"),
-            (2, 0, "Batt Comp"), (2, 3, "Have GPS"), (2, 4, "Prop In"),
+            (2, 0, "Batt Comp"), (2, 4, "Prop In"),
             (2, 5, "Turn WP"), (2, 6, "Beep WP"),
         ]
         for which, bit, name in self.config_flags:
@@ -1630,6 +1668,7 @@ class MainWindow(QMainWindow):
         self.flash_btn.clicked.connect(self.show_dfu_flasher)
         self.ident_btn.clicked.connect(self.show_identify_window)
         self.esc_btn.clicked.connect(self.enter_esc_programming)
+        self.ubx_relay_btn.clicked.connect(self._on_gps_ubx_relay_toggle)
         self.dump_trace_btn.clicked.connect(self.dump_black_box)
         self.replay_btn.clicked.connect(self.open_replay)
         self.speech_level_combo.currentIndexChanged.connect(self.speech_level_changed)
@@ -1694,6 +1733,28 @@ class MainWindow(QMainWindow):
         QMessageBox.warning(self, "ESC Programming",
                             "The FC refused ESC programming mode.\n\n"
                             "Disarm the aircraft and try again.")
+
+    def _on_gps_ubx_relay_toggle(self):
+        if not self.connected:
+            QMessageBox.information(self, "GPS UBX Relay",
+                                    "Connect to the FC first (Connect button).")
+            return
+        self._gps_ubx_relay_desired = not self._gps_ubx_relay_on
+        self.log_debug(
+            f"📤 GPS UBX relay {'ON' if self._gps_ubx_relay_desired else 'OFF'} requested",
+            "Info")
+        self.send_request(PacketTag.MISC, MiscCommand.GPS_UBX_RELAY,
+                          1 if self._gps_ubx_relay_desired else 0)
+
+    def _update_gps_ubx_relay_button(self):
+        if self._gps_ubx_relay_on:
+            self.ubx_relay_btn.setText("UBX •")
+            self.ubx_relay_btn.setStyleSheet(
+                "font-weight: bold; color: #c0392b; background-color: #b03a2e;")
+        else:
+            self.ubx_relay_btn.setText("UBX")
+            self.ubx_relay_btn.setStyleSheet(
+                "font-weight: bold; color: #e67e22;")
 
     def _finalize_bb_dump(self):
         self._bb_dump_timer.stop()
@@ -1837,6 +1898,86 @@ class MainWindow(QMainWindow):
                    f"airframe, Apply & Reboot, then re-calibrate IMU and mag")
             print(f"[BOOT] {msg}")
             self.log_debug(msg, "Warnings")
+
+    _GPS_ABSENT_CONFIRM_REPORTS = 3
+
+    def _update_gps_rx(self, f):
+        """Surface the receiver's wire state, because nothing else can.
+
+        The FC parser accepts only a 0xB5 UBX preamble, so a module emitting
+        NMEA is discarded silently and F.GPSValid cannot tell "no bytes at all"
+        from "bytes we refuse to parse". These three counters are the whole
+        difference: bytes > 0 with packets == 0 is a protocol or baud mismatch;
+        bytes == 0 on a wired port is a dead or absent receiver.
+
+        The counters only exist on FC builds from 2026-11-11 onward, so an older
+        FC shows "---" rather than a row of zeroes that would read as a fault.
+        """
+        if not getattr(f, 'gps_rx_present', False):
+            for lbl in (self.gps_rx_bytes, self.gps_rx_packets, self.gps_rx_drops):
+                lbl.setText("---")
+            self.gps_rx_note.setText("")
+            return
+
+        self.gps_rx_bytes.setText(str(f.gps_rx_bytes))
+        self.gps_rx_packets.setText(str(f.gps_rx_packets))
+        self.gps_rx_drops.setText(str(f.gps_rx_drops))
+
+        if not f.gps_port_wired:
+            note = "port not wired on this board"
+        elif f.gps_rx_bytes == 0:
+            note = "wired, nothing received"
+        elif f.gps_rx_packets == 0:
+            note = "bytes but no UBX packets"
+        else:
+            note = ""
+        self.gps_rx_note.setText(note)
+
+        self._check_gps_absence()
+
+    def _check_gps_absence(self):
+        """Evaluate F.GPSAbsent from the last flag report.
+
+        The nav packet carries no flag block, so the flag bits arrive on a
+        different tag and are kept in current_flag_bits. Deciding only when
+        bit 84 is actually present keeps "not reported yet" from reading as
+        "present", which is the mistake the magnetometer tab made once.
+        """
+        bits = self.current_flag_bits
+        if len(bits) > 84:
+            self._set_gps_absence(bool(bits[84]))
+
+    def _set_gps_absence(self, absent):
+        """Retire the GPS and Navigation boxes when the FC reports no receiver.
+
+        Absence is a positive report (F.GPSAbsent): either the board has no GPS
+        port wired at all, or the port is wired and nothing has ever arrived on
+        it. It is never inferred from a lost fix, so a receiver that is present
+        but not yet locked keeps both boxes visible with their accuracy figures
+        red - that is information the pilot needs, not a missing device.
+
+        Debounced like the magnetometer tab, and latched once hidden: a receiver
+        that starts talking mid-session is a bench fault being cleared, not a
+        configuration change, and a box that reappeared would be a distraction
+        in flight. The FC clears its own flag, so a reboot restores the truth.
+        """
+        if self._gps_absent is True:
+            return
+        if not absent:
+            self._gps_absent_reports = 0
+            return
+        self._gps_absent_reports += 1
+        if self._gps_absent_reports < self._GPS_ABSENT_CONFIRM_REPORTS:
+            return
+        self._gps_absent = True
+        self.gps_box.setVisible(False)
+        self.nav_box.setVisible(False)
+        self.nav_no_gps_label.setText(
+            "No GPS: Hold and WP Nav are inert; RTH becomes an abortable "
+            "forced landing")
+        self.nav_no_gps_label.setVisible(True)
+        self.log_debug("No GPS receiver detected (FC telemetry bit 84) - "
+                       "GPS and Navigation boxes retired for this session", "Info")
 
     def _verify_post_commit_config(self, parsed):
         """Gate the deferred post-commit readback on the FC's own reboot report.
@@ -2113,10 +2254,9 @@ class MainWindow(QMainWindow):
                 # buffered and drained on either link - but on USB the host may
                 # still be mid-reopen backoff, so ask for it again. Free when
                 # nothing is pending verification.
-                self.send_request(PacketTag.REQUEST, PacketTag.REBOOT_INFO, 0)
+                self.send_request(PacketTag.REBOOT_INFO, 0, 0)
             else:
                 self.send_request(PacketTag.PARAM_TAGGED_READ, 255, 0, None)
-            self.send_request(PacketTag.MIN, 0, 0, None)
             self.send_request(PacketTag.AFNAME, 0, 0, None)
             self.send_request(PacketTag.TUNING, 0, 0, None)
             self._identify_poll_timer.start(1000)
@@ -2906,7 +3046,7 @@ class MainWindow(QMainWindow):
             60: "Unused", 61: "Unused", 62: "Calibration", 63: "AFName",
             64: "Wind", 65: "Unused", 66: "SerialPorts", 67: "ExecTime",
             68: "Unused", 69: "LinkStats", 70: "InitState", 71: "ParamRead",
-            76: "I2CErrors", 77: "ParamImage",
+            76: "I2CErrors", 77: "ParamImage", 79: "State", 80: "GPS_UBX",
         }
         tag_name = TAG_NAMES.get(tag, f"Unknown({tag})")
         tag_ok = "OK" if parsed is not None else "FAIL"
@@ -2916,7 +3056,7 @@ class MainWindow(QMainWindow):
         now_t = time.time()
         last = getattr(self, '_rx_print_t', {})
         interval = last.get(tag, 0.0)
-        if tag_ok == "FAIL" or tag > 68 or now_t - interval >= 0.8:
+        if tag_ok == "FAIL" or (tag > 68 and tag not in (79, 80)) or now_t - interval >= 0.8:
             detail = f" raw={data.hex()}" if tag_ok == "FAIL" else ""
             print(f"[RX] tag={tag} ({tag_name}) {tag_ok} len={len(data)}B{detail}")
         last[tag] = now_t
@@ -3007,7 +3147,9 @@ class MainWindow(QMainWindow):
                                 "gps_type", "gps_update_rate",
                                 "curr_wp", "wp_bearing",
                                 "distance_to_wp", "cross_track_error",
-                                "mag_var_wmm")}
+                                "mag_var_wmm",
+                                "gps_port_wired", "gps_rx_present",
+                                "gps_rx_bytes", "gps_rx_packets", "gps_rx_drops")}
                 else:
                     old_pwm = None
                     old_rc = None
@@ -3050,7 +3192,9 @@ class MainWindow(QMainWindow):
                                  "gps_type", "gps_update_rate",
                                  "curr_wp", "wp_bearing", "cross_track_error",
                                  "nav_state", "alarm_state",
-                                 "mag_var_wmm"):
+                                 "mag_var_wmm",
+                                 "gps_port_wired", "gps_rx_present",
+                                 "gps_rx_bytes", "gps_rx_packets", "gps_rx_drops"):
                         setattr(self.flight_data, attr, getattr(parsed, attr, getattr(self.flight_data, attr)))
                     data_manager.update_flight_data(self.flight_data)
 
@@ -3106,13 +3250,28 @@ class MainWindow(QMainWindow):
                         ack_handler.handle_ack(at, ok)
 
                     cmd = getattr(self, '_pending_misc_command', None)
-                    if at == PacketTag.MISC and cmd is not None:
+                    # The FC calibration ACKs (IMU/Accel/Mag) go out with tag
+                    # 52, not with the MiscCommand sub-tag - the documented
+                    # contract for tag-52 acks. ESC_PROG and GPS_UBX_RELAY
+                    # ack with the sub-tag. Accept both.
+                    if cmd is not None and (at == cmd or at == PacketTag.MISC):
                         self._pending_misc_command = None
                         if cmd == MiscCommand.ESC_PROG:
                             if ok:
                                 self._on_esc_prog_ack()
                             else:
                                 self._on_esc_prog_denied()
+                        elif cmd == MiscCommand.GPS_UBX_RELAY:
+                            if ok:
+                                self._gps_ubx_relay_on = self._gps_ubx_relay_desired
+                                self._update_gps_ubx_relay_button()
+                                self.log_debug(
+                                    f"📡 GPS UBX relay {'enabled' if self._gps_ubx_relay_on else 'disabled'}",
+                                    "Info")
+                            else:
+                                self.log_debug(
+                                    "❌ GPS UBX relay command NACKed by the FC",
+                                    "Errors")
                         elif self.calib_window is not None:
                             self.calib_window.on_misc_ack(cmd, ok)
 
@@ -3220,6 +3379,23 @@ class MainWindow(QMainWindow):
                 # detection (post-commit verification) is tag 68's job.
                 if parsed is not None and hasattr(parsed, 'pf_terms'):
                     self._pf_term_mask = parsed.pf_terms or 0
+
+            case 79:
+                # One byte, emitted on change from inside the routine it names.
+                # Boot steps are 14..38 and are the load-bearing part: the last
+                # one before a reset names the routine that hung. The eLive*
+                # liveness markers (60..70) alternate with the real state every
+                # announce period, so they are stored but not logged - the raw
+                # log keeps them, and logging them would print ~20 lines a
+                # second forever.
+                if parsed is not None and hasattr(parsed, 'state'):
+                    prev_state = self._last_fc_state
+                    self._last_fc_state = parsed.state
+                    if (parsed.state < FlightState.eLivePreflight
+                            and parsed.state != prev_state):
+                        self.log_debug(
+                            f"  FC state {parsed.state} "
+                            f"({FlightState.get_name(parsed.state)})", "Info")
 
             case 67:
                 packet_logger.log_received(67, "EXEC", parsed)
@@ -3330,6 +3506,27 @@ class MainWindow(QMainWindow):
                 # so the slice needs no further guard.
                 self._on_meta_packet(data[4:4 + extract_short(data, 2)])
 
+            case 80:
+                if isinstance(parsed, dict):
+                    packet_logger.log_received(80, "GPS_UBX", parsed)
+                    raw = parsed.get('raw', b'')
+                    now = time.time()
+                    if now - getattr(self, '_gps_ubx_log_t', 0.0) >= 0.5:
+                        self._gps_ubx_log_t = now
+                        if len(raw) >= 6:
+                            cls_id = (raw[2] << 8) | raw[3]
+                            ln = raw[4] | (raw[5] << 8)
+                            self.log_debug(
+                                f"📡 GPS UBX 0x{cls_id:04X} payload={ln}B "
+                                f"relayed {len(raw)}B (first 64B of sentence)",
+                                "Info")
+                        else:
+                            self.log_debug(
+                                f"📡 GPS UBX relay: {len(raw)}B (truncated)",
+                                "Info")
+                else:
+                    packet_logger.log_received(80, "GPS_UBX", parsed)
+
             case _:
                 packet_logger.log_received(tag, f"TAG{tag}", parsed)
 
@@ -3349,7 +3546,7 @@ class MainWindow(QMainWindow):
         self._meta_sweep_drift = 0
         self._meta_sweep_route = ""
         self._meta_digest_seen = False
-        self.send_request(PacketTag.REQUEST, PacketTag.META_REQ, 0xFF, 0)
+        self.send_request(PacketTag.META_REQ, 0xFF, 0)
         self._meta_digest_timer.start(600)
 
     def _on_meta_digest(self, digest):
@@ -3385,8 +3582,7 @@ class MainWindow(QMainWindow):
         if self._meta_sweep_idx >= self._meta_sweep_max:
             self._meta_sweep_finalise()
             return
-        self.send_request(PacketTag.REQUEST, PacketTag.META_REQ,
-                          self._meta_sweep_idx, 0)
+        self.send_request(PacketTag.META_REQ, self._meta_sweep_idx, 0)
         self._meta_sweep_idx += 1
 
     def _meta_sweep_finalise(self):
@@ -3611,7 +3807,7 @@ class MainWindow(QMainWindow):
                     color = "#e74c3c"
                     text_color = "white"
                     font_weight = "bold"
-                elif flag_key in ['gps_ok', 'origin', 'gps_alt', 'alt_hold', 'hold_alt', 'signal']:
+                elif flag_key in ['gps_ok', 'gps_active', 'origin', 'gps_alt', 'alt_hold', 'hold_alt', 'signal']:
                     color = "#27ae60"
                     text_color = "white"
                     font_weight = "bold"
@@ -3628,7 +3824,7 @@ class MainWindow(QMainWindow):
                     text_color = "white"
                     font_weight = "bold"
             else:
-                if flag_key in ['gps_ok', 'baro', 'imu', 'mag']:
+                if flag_key in ['gps_ok', 'gps_active', 'baro', 'imu', 'mag']:
                     color = "#e74c3c"
                     text_color = "white"
                     font_weight = "bold"
@@ -3723,6 +3919,7 @@ class MainWindow(QMainWindow):
         if hasattr(f, 'flag_bits') and f.flag_bits:
             self.current_flag_bits = f.flag_bits
             self.update_flag_colors(f.flag_bits)
+            self._check_gps_absence()
         elif self.current_flag_bits:
             self.update_flag_colors(self.current_flag_bits)
         
@@ -3868,6 +4065,8 @@ class MainWindow(QMainWindow):
             self.gps_vacc.setStyleSheet(f"color: {color};")
             self.gps_sacc.setStyleSheet(f"color: {color};")
             self.gps_cacc.setStyleSheet(f"color: {color};")
+
+            self._update_gps_rx(f)
         
         if hasattr(f, 'gps_update_rate') and f.gps_update_rate > 0:
             self.gps_rate_label.setText(f"{f.gps_update_rate:.0f} Hz")

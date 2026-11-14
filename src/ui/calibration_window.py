@@ -18,7 +18,7 @@ from PyQt5.QtGui import *
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from protocol_constants import *
-from protocol_enums import PacketTag, MiscCommand, ParamIndex, Config1Bits
+from protocol_enums import PacketTag, MiscCommand
 from packet_parser import *
 from core.data_manager import data_manager
 from orientation_solver import classify as ori_classify, next_knobs as ori_next_knobs
@@ -777,24 +777,15 @@ class CalibrationWindow(QMainWindow):
                   "magnetometer calibration retired for this session")
 
     def _mag_in_use(self) -> Optional[bool]:
-        """Whether the FC's MagInUse() holds, or None if UseMag is not known.
+        """Whether the FC's MagInUse() holds, or None if presence is unknown.
 
-        Mirrors MagInUse() == (UsingMag && F.MagnetometerActive). Only the
-        UsingMag half is available here; F.MagnetometerActive arrives with the
-        flag report the caller already has, and it combines them at the call
-        site. Returns None when the Parameters page has never been opened or
-        the config has not been read back, so the caller can avoid claiming an
-        arming consequence it cannot substantiate.
+        MagInUse() is now exactly F.MagnetometerActive: a fitted magnetometer is
+        always used, so presence and use are the same fact and there is no
+        permission bit left to consult. Returns None rather than a claim when the
+        caller has no flag report, so an arming consequence is never asserted
+        from an unknown.
         """
-        if not self.parent_window:
-            return None
-        param_window = getattr(self.parent_window, 'param_window', None)
-        if param_window is None:
-            return None
-        value = param_window.config_bits(ParamIndex.CONFIG1_BITS)
-        if value is None:
-            return None
-        return bool(value & int(Config1Bits.eUsingMag))
+        return self._mag_present
 
     def _set_mag_state(self, present, calibrated, failed):
         """Apply the two-flag device model to the Magnetometer tab.
@@ -822,18 +813,10 @@ class CalibrationWindow(QMainWindow):
             self.mag_cal_status.setText("Mag: FAILED - recalibrate")
             self.mag_cal_status.setStyleSheet("padding: 5px; background-color: #c0392b; color: white; font-weight: bold; border-radius: 4px;")
         elif not calibrated:
-            # UNCAL only blocks arming when the FC would actually demand it.
-            # CalibrationSufficient() is `MagInUse() && !MagCal.Calibrated`, so
-            # with UseMag clear the mag is present but unused and arming is not
-            # blocked. Asserting "blocks arming" there would be a false claim on
-            # exactly the bench case a pilot hits first - mag fitted, UseMag off.
-            in_use = self._mag_in_use()
-            if in_use:
-                text = "Mag: fitted, NOT calibrated - BLOCKS ARMING"
-            elif in_use is False:
-                text = "Mag: fitted, NOT calibrated (mag not in use - arming OK)"
-            else:
-                text = "Mag: fitted, NOT calibrated"
+            # A fitted magnetometer is always in use, so an uncalibrated one
+            # always blocks arming: CalibrationSufficient() is
+            # `MagInUse() && !MagCal.Calibrated` and MagInUse() is now presence.
+            text = "Mag: fitted, NOT calibrated - BLOCKS ARMING"
             self.mag_cal_status.setText(text)
             self.mag_cal_status.setStyleSheet("padding: 5px; background-color: #f39c12; color: white; font-weight: bold; border-radius: 4px;")
         self.mag_start_btn.setEnabled(True)

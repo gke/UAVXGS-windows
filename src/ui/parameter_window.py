@@ -4150,7 +4150,7 @@ class ParameterWindow(QMainWindow):
 
         self.config1_checks = []
         config1_bits = [
-            ("Ext Mag", 0), ("Autoland", 1), ("Use Mag", 2),
+            ("Ext Mag", 0), ("Autoland", 1), ("Unused 1-2", 2, True),
             ("Emulation", 3, True, "Emulation disabled — commissioning is real flight only."),
             ("AH Alarm", 4), ("GPS Alt", 5),
             ("Unused 1-6", 6, True), ("Clamp", 7),
@@ -4171,7 +4171,7 @@ class ParameterWindow(QMainWindow):
         self.config2_checks = []
         config2_bits = [
             ("Batt Comp", 0), ("Unused 2-1", 1, True), ("Unused 2-2", 2, True),
-            ("Have GPS", 3), ("Prop In", 4), ("Turn WP", 5), ("Beep WP", 6),
+            ("Unused 2-3", 3, True), ("Prop In", 4), ("Turn WP", 5), ("Beep WP", 6),
             ("Unused 2-7", 7, True),
         ]
         for i, item in enumerate(config2_bits):
@@ -4180,16 +4180,18 @@ class ParameterWindow(QMainWindow):
             cb = QCheckBox(name)
             cb.setProperty("bit", bit)
             cb.stateChanged.connect(lambda s, b=bit: self.bit_changed(ParamIndex.CONFIG2_BITS, b, s))
-            if name == "Have GPS":
-                cb.setToolTip("Sets/clears FC HaveGPS (drives InitialisingGPS / no-GPS boot):\n"
-                              "bit SET = GPS required (waits for a fix),\n"
-                              "bit CLEAR = no GPS - FC skips InitialisingGPS and flies without a satellite fix")
-            elif bit == 1:
+            if bit == 1:
                 cb.setEnabled(False)
                 cb.setToolTip("Unused — free config bit (Config2 bit 1), was Fast Start.\n"
                               "FastStart only skipped the gyro grab; the grab now always runs "
                               "and falls back on the stored bias, and a never-calibrated FC is "
                               "blocked from arming by the FC instead.")
+            elif bit == 3:
+                cb.setEnabled(False)
+                cb.setToolTip("Unused — free config bit (Config2 bit 3), was Have GPS.\n"
+                              "A receiver is used when one is wired and speaks UBX; the FC "
+                              "latches presence from the first valid packet, so there is no "
+                              "permission bit. To fly without GPS, disconnect it.")
             elif unused:
                 cb.setEnabled(False)
                 cb.setToolTip(f"Unused — free config bit (Config2 bit {bit}). Available for a future feature.")
@@ -5268,6 +5270,9 @@ class ParameterWindow(QMainWindow):
         flash on connect, or the file just loaded)."""
         self._user_dir = workspace.airframes_dir()
         dialog = AfLoadDialog(self, classify_fn=self._category_for_af_file)
+        win = self.window()
+        if win is not None:
+            dialog.move(win.geometry().topLeft())
         if dialog.exec_() != QDialog.Accepted:
             return
         path = dialog.get_selected_path()
@@ -5446,13 +5451,11 @@ class ParameterWindow(QMainWindow):
                     combo.blockSignals(False)
         
         # Defaults: Config1 = RTHDescend|AltHoldAlarm, mirroring the FC's
-        # DEFAULT_CONFIG1 in params.c. It was EnforceDriveSymmetry|UsingMag here,
-        # which disagreed with both the FC default and Config1Bits.DEFAULT - the
-        # two GCS sites had drifted. eUsingMag is dropped for the arming-deadlock
-        # reason recorded at Config1Bits.DEFAULT; Config2 = Batt Comp + GPS +
-        # Nav Beep (matches the fleet-wide retune sweep).
+        # DEFAULT_CONFIG1 in params.c; Config2 = Batt Comp + Nav Beep, mirroring
+        # DEFAULT_CONFIG2. Both the Use Mag and Have GPS permission bits are
+        # retired — presence of the device decides, not a declaration.
         self._set_config_default(ParamIndex.CONFIG1_BITS, int(Config1Bits.eUseRTHDescend | Config1Bits.eUseAltHoldAlarm))
-        self._set_config_default(ParamIndex.CONFIG2_BITS, int(Config2Bits.eUseBatteryComp | Config2Bits.eUseGPS | Config2Bits.eUseNavBeep))
+        self._set_config_default(ParamIndex.CONFIG2_BITS, int(Config2Bits.eUseBatteryComp | Config2Bits.eUseNavBeep))
         
         self.update_config_display()
         self.update_rc_display()

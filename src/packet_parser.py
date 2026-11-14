@@ -180,6 +180,11 @@ class FlightData:
     east_pos_e: float = 0.0
     nav_state_timeout: float = 0.0
     gps_type: int = 0
+    gps_port_wired: bool = False
+    gps_rx_present: bool = False
+    gps_rx_bytes: int = 0
+    gps_rx_packets: int = 0
+    gps_rx_drops: int = 0
     gps_update_rate: float = 0.0
     nav_sensitivity: float = 0.0
     mag_var_wmm: float = 0.0
@@ -255,6 +260,18 @@ class RebootInfoData:
     # How this boot obtained its config block (FC BootDiag enum): 0=not
     # reported, 1=restored, 2=foreign magic, 3=table CRC, 4=layout, 5=blank.
     boot_diag: int = 0
+
+
+@dataclass
+class StateData:
+    """Tag 79 — one-byte flight/boot-state breadcrumb.
+
+    Emitted by the FC's TxState() on every state change, from inside the routine
+    it names. Boot steps (14..38) are the load-bearing part: the last one
+    received before a reset names the routine that hung, which is the only way
+    to localise a silent boot loop from the raw log.
+    """
+    state: int = 0
 
 
 @dataclass
@@ -586,7 +603,7 @@ def parse_nav_packet(data: bytes) -> Optional[FlightData]:
     """
     Parse UAVXNavPacket (Tag=14)
     Based on telem.c SendNavPacket() — analog values raw float32.
-    Body: 86 bytes
+    Body: 86 bytes minimum, 98 bytes when the GPS RX counters are present
       [0-4]   navState, alarm, sats, fix, currWp
       [5-20]  hAcc/vAcc/sAcc/cAcc f32 (m)
       [21-24] WPBearing rad       [25-28] CrossTrack m
@@ -596,9 +613,10 @@ def parse_nav_packet(data: bytes) -> Optional[FlightData]:
       [49-52] NorthPosE m         [53-56] EastPosE m
       [57-59] navStateTimeout ms int24
       [60-63] GPS.dT s f32
-      [64-67] hwVersion u32       [68] ubxMajor [69] pad
+      [64-67] hwVersion u32       [68] ubxMajor [69] GPS port wired
       [70-73] NavCorr pitch       [74-77] NavCorr roll
       [78-81] Yaw P.Error rad     [82-85] MagVar deg
+      [86-89] rx bytes  [90-93] rx packets  [94-97] rx drops  (u32, FC >= 2026-11-11)
     """
     if len(data) < 86:
         return None
@@ -634,6 +652,7 @@ def parse_nav_packet(data: bytes) -> Optional[FlightData]:
     dT_s = extract_real32(data, 60)
     f.gps_update_rate = 1.0 / dT_s if dT_s > 0 else 0.0
     f.gps_type = extract_byte(data, 68)
+    f.gps_port_wired = bool(extract_byte(data, 69))
 
     # Correction terms arrive in radians; the yaw P error is published in
     # degrees for the tuning view (legacy behaviour, now actually correct).
@@ -643,6 +662,12 @@ def parse_nav_packet(data: bytes) -> Optional[FlightData]:
 
     if len(data) >= 86:
         f.mag_var_wmm = extract_real32(data, 82)
+
+    if len(data) >= 98:
+        f.gps_rx_present = True
+        f.gps_rx_bytes = extract_int32(data, 86)
+        f.gps_rx_packets = extract_int32(data, 90)
+        f.gps_rx_drops = extract_int32(data, 94)
 
     return f
 
@@ -963,6 +988,19 @@ def parse_reboot_info(data: bytes) -> Optional[RebootInfoData]:
     r.reset_cause = data[0]
     r.boot_diag = data[1]
     return r
+
+
+def parse_state_packet(data: bytes) -> Optional[StateData]:
+    """Parse UAVXStatePacket (Tag=79) — telem.c TxState().
+    Body: state u8(1). Value is the FC enum FlightStates, so boot steps are
+    14..38 and the main-loop liveness markers are 60..70.
+    """
+    if len(data) < 1:
+        return None
+
+    s = StateData()
+    s.state = data[0]
+    return s
 
 
 def parse_link_stats(data: bytes) -> LinkStatsData:
@@ -1403,6 +1441,9 @@ def parse_control_packet(data: bytes) -> Optional[ControlData]:
     return c
 
 
+def parse_gps_ubx_packet(data: bytes) -> dict:
+    return {"tag": 80, "length": len(data), "raw": bytes(data)}
+
 def parse_packet(data: bytes, voltage_trim: float = 1.0) -> Tuple[Optional[object], int]:
     """
     Parse a packet based on its tag.
@@ -1474,6 +1515,10 @@ def parse_packet(data: bytes, voltage_trim: float = 1.0) -> Tuple[Optional[objec
             return ns, tag
         case 71:
             return parse_param_packet(body), tag
+        case 79:
+            return parse_state_packet(body), tag
+        case 80:
+            return parse_gps_ubx_packet(body), tag
         case 74:
             return parse_test_response(body), tag
         case 76:

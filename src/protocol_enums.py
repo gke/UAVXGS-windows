@@ -61,6 +61,8 @@ class PacketTag(IntEnum):
     AFNAME_SET = 75
     I2C_ERRORS = 76
     REBOOT = 78
+    STATE = 79  # flight/boot-state breadcrumb, one byte, emitted on change
+    GPS_UBX_RELAY = 80  # GPS UBX raw sentence relay
     UNUSED_ALTITUDE_CONTROL = 60
     UNUSED_SOARING = 61
     CALIBRATION = 62
@@ -115,6 +117,7 @@ class MiscCommand(IntEnum):
     SET_NAV_MODE = 11     # Set NavMode RC channel value: 0=Low(PIC), 1=Middle(Hold/Mission), 2=High(RTH)
     CYCLE_BB_LOG = 12     # Cycle black box log type
     ESC_PROG = 13         # Enter ESC programming (4way/MSP runtime feed-through)
+    GPS_UBX_RELAY = 14    # Toggle GPS UBX raw-sentence relay (RAM-only, a2 = desired state)
 
 
 # ============================================================================
@@ -616,7 +619,6 @@ class Config1Bits(IntFlag):
     """Config1 bit masks - matches params.h Config1"""
     eUseInvertMag = 0x01           # bit 0
     eUseRTHDescend = 0x02          # bit 1
-    eUsingMag = 0x04              # bit 2
     eEmulationEnable = 0x08         # bit 3
     eUseAltHoldAlarm = 0x10       # bit 4
     eUseOffsetHome = 0x20          # bit 5
@@ -628,11 +630,16 @@ class Config1Bits(IntFlag):
     eUnused1_6 = 0x40
     eTestMission = eUnused1_6      # legacy .af token — do not re-use
 
+    # bit 2 — FREE (was Use Mag). A magnetometer is used when one is fitted and
+    # answers its probe (F.MagnetometerActive); presence alone decides fusion,
+    # so there is no permission to withdraw. Absent an override bit a pilot who
+    # does not want the compass disconnects it, which is the physical statement
+    # of the same intent. eUsingMag is kept as an alias because every
+    # generic/*.af carries CONFIG1_BITS=eUseRTHDescend|eUsingMag.
+    eUnused1_2 = 0x04
+    eUsingMag = eUnused1_2         # legacy .af token — do not re-use
+
     # Default Config1 = FC DEFAULT_CONFIG1 (params.c): RTHDescend|AltHoldAlarm.
-    # eUsingMag is NOT in the default (2026-09-29): most target boards have no
-    # magnetometer fitted, and with the bit set the FC's arming gate demands a
-    # mag calibration that cannot be obtained. The bit remains settable as an
-    # operator override to ignore a present-but-untrustworthy mag.
     DEFAULT = eUseRTHDescend | eUseAltHoldAlarm
 
 
@@ -651,14 +658,18 @@ class Config2Bits(IntFlag):
     eUnused2_2 = 0x04              # bit 2 — FREE (was UseESCProg). ESC-Prog is now
                                    # runtime-triggered via the GCS ESC button (miscESCProg),
                                    # so it needs no config bit. Available for a future feature.
-    eUseGPS = 0x08             # bit 3
+    eUnused2_3 = 0x08              # bit 3 — FREE (was Have GPS). A receiver is
+                                   # used when one is wired and speaks UBX; the
+                                   # FC latches presence from the first valid
+                                   # packet. eUseGPS kept as a legacy .af token.
+    eUseGPS = eUnused2_3           # legacy .af token — do not re-use
     ePropsInwards = 0x10           # bit 4 — SET = front two props rotate INWARDS (usual convention)
     eUseTurnToWP = 0x20           # bit 5
     eUseNavBeep = 0x40             # bit 6
     eUnused2_7 = 0x80              # bit 7 — FREE. Available for a future feature.
 
-    # Default Config2 = FC DEFAULT_CONFIG2 (params.c): BattComp|GPS|NavBeep
-    DEFAULT = eUseBatteryComp | eUseGPS | eUseNavBeep
+    # Default Config2 = FC DEFAULT_CONFIG2 (params.c): BattComp|NavBeep
+    DEFAULT = eUseBatteryComp | eUseNavBeep
 
 
 # ============================================================================
