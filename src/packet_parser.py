@@ -1441,9 +1441,6 @@ def parse_control_packet(data: bytes) -> Optional[ControlData]:
     return c
 
 
-def parse_gps_ubx_packet(data: bytes) -> dict:
-    return {"tag": 80, "length": len(data), "raw": bytes(data)}
-
 def parse_packet(data: bytes, voltage_trim: float = 1.0) -> Tuple[Optional[object], int]:
     """
     Parse a packet based on its tag.
@@ -1517,8 +1514,6 @@ def parse_packet(data: bytes, voltage_trim: float = 1.0) -> Tuple[Optional[objec
             return parse_param_packet(body), tag
         case 79:
             return parse_state_packet(body), tag
-        case 80:
-            return parse_gps_ubx_packet(body), tag
         case 74:
             return parse_test_response(body), tag
         case 76:

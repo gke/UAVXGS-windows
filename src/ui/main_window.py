@@ -249,10 +249,8 @@ class TelemetryThread(QThread):
         self._is_closing = False
         self.verbose_serial = os.environ.get("UAVXGS_VERBOSE_SERIAL", "0") == "1"
 
-    # Auto-reconnect pacing after a dropped CDC link. A bench USB reset takes
-    # the port away for ~30 s (host re-enumeration); retry until it returns.
-    _RECONNECT_BACKOFF_START_S = 1.0
-    _RECONNECT_BACKOFF_MAX_S = 5.0
+    # No auto-reconnect: a dropped link ends the session and the operator
+    # presses Connect. Nothing reopens the port on its own.
     
     def run(self):
         import serial
@@ -280,11 +278,9 @@ class TelemetryThread(QThread):
                 return
 
             self.serial = serial.Serial(self.port, self.baud, timeout=0.1)
-            # First successful open: signal the GUI connected NOW, not only on
-            # a later reopen. A reopen (line 274) exists for dropped CDC links;
-            # a stable UART adapter never drops, so without this the GUI stays
-            # stuck at "Connecting..." and never triggers the on_connected(True)
-            # param readback / rawlog start / read-lock release.
+            # Signal the GUI connected NOW, not only after the first byte: the
+            # on_connected(True) handler starts the rawlog session and the
+            # param readback. Without this the GUI stays at "Connecting...".
             self.connected.emit(True)
             self._link_loop(serial)
 
@@ -296,45 +292,23 @@ class TelemetryThread(QThread):
             self.connected.emit(False)
 
     def _link_loop(self, serial):
-        """Read/decode loop with automatic reconnect.
+        """Read/decode loop.
 
-        A vanished or stalled CDC device surfaces as OSError from read().
-        That is retryable: a bench USB reset takes the port away for ~30 s
-        while the host re-enumerates. We emit connected(False), close the
-        port, then keep trying to reopen with a bounded backoff until the
-        device returns (or stop()). A non-OSError exception is a decode or
-        logic bug - log it and stand down instead of hot-reopening a broken
-        loop forever. A dropped link never feeds bytes into the old rawlog:
-        the GUI's on_connected(False) already stopped it, and a successful
-        reopen starts a fresh rawlog session via on_connected(True).
+        A vanished or stalled device surfaces as OSError from read(). That ends
+        the link: the port is closed and the loop returns, leaving the GUI
+        disconnected until the operator presses Connect. Nothing reopens the
+        port automatically, so a reconnect is always a deliberate act and a
+        dropped link never feeds bytes into the old rawlog. A non-OSError
+        exception is a decode or logic bug - log it and stand down.
         """
         buffer = bytearray()
         packet = bytearray()
         esc_flag = False
-        backoff = self._RECONNECT_BACKOFF_START_S
 
         while self.running and not self._is_closing:
             try:
                 if self.serial is None or not self.serial.is_open:
-                    # Port was dropped (or stop() is closing us). Try to
-                    # reopen the device; reopen failures are EXPECTED until
-                    # the USB stack re-enumerates, so they just pace the
-                    # backoff instead of killing the link.
-                    try:
-                        self.serial = serial.Serial(
-                            self.port, self.baud, timeout=0.1)
-                    except Exception:
-                        if not self._reconnect_pause(backoff):
-                            break
-                        backoff = min(backoff * 2.0,
-                                      self._RECONNECT_BACKOFF_MAX_S)
-                        continue
-                    self.connected.emit(True)
-                    backoff = self._RECONNECT_BACKOFF_START_S
-                    buffer.clear()
-                    packet.clear()
-                    esc_flag = False
-                    continue
+                    break
 
                 if self.serial.in_waiting:
                     data = self.serial.read(self.serial.in_waiting)
@@ -389,10 +363,9 @@ class TelemetryThread(QThread):
             except OSError as e:
                 if self._is_closing:
                     break
-                print(f"<telem> link error: {e!r} -> reconnecting", flush=True)
-                self.connected.emit(False)
-                self._close_port()
-                # The loop top reopens (or paces the backoff if not yet back)
+                print(f"<telem> link error: {e!r} -> link closed; press Connect",
+                      flush=True)
+                break
                 
             except Exception as e:
                 if not self._is_closing:
@@ -402,14 +375,6 @@ class TelemetryThread(QThread):
                 break
             
             QThread.msleep(10)
-
-    def _reconnect_pause(self, seconds):
-        """Sleep up to `seconds` in small slices so stop() can interrupt."""
-        deadline = time.monotonic() + seconds
-        while self.running and not self._is_closing \
-                and time.monotonic() < deadline:
-            QThread.msleep(50)
-        return self.running and not self._is_closing
 
     def _close_port(self):
         if self.serial:
@@ -555,8 +520,6 @@ class MainWindow(QMainWindow):
         self._trace_combo_loading = False
         self._trace_fc_value = None
         self._trace_write_pending = None
-        self._gps_ubx_relay_on = False
-        self._gps_ubx_relay_desired = False
 
         self.setup_ui()
         self.setup_menu()
@@ -852,16 +815,6 @@ class MainWindow(QMainWindow):
         self.esc_btn.setFixedWidth(80)
         self.esc_btn.setStyleSheet("font-weight: bold; color: #e67e22;")
         toolbar.addWidget(self.esc_btn)
-
-        self.ubx_relay_btn = QPushButton("UBX")
-        self.ubx_relay_btn.setToolTip(
-            "GPS UBX raw-sentence relay (RAM-only; the FC resets it OFF on "
-            "reboot). Streams the first 64 bytes of each UBX sentence on "
-            "tag 80 for in-GCS decoding — for diagnosing a silent GPS. "
-            "Orange = off, red = on.")
-        self.ubx_relay_btn.setFixedWidth(80)
-        self.ubx_relay_btn.setStyleSheet("font-weight: bold; color: #e67e22;")
-        toolbar.addWidget(self.ubx_relay_btn)
 
         # Trace/Replay buttons hidden for now (redundant)
         self.replay_btn = QPushButton("Replay")
@@ -1668,7 +1621,6 @@ class MainWindow(QMainWindow):
         self.flash_btn.clicked.connect(self.show_dfu_flasher)
         self.ident_btn.clicked.connect(self.show_identify_window)
         self.esc_btn.clicked.connect(self.enter_esc_programming)
-        self.ubx_relay_btn.clicked.connect(self._on_gps_ubx_relay_toggle)
         self.dump_trace_btn.clicked.connect(self.dump_black_box)
         self.replay_btn.clicked.connect(self.open_replay)
         self.speech_level_combo.currentIndexChanged.connect(self.speech_level_changed)
@@ -1733,28 +1685,6 @@ class MainWindow(QMainWindow):
         QMessageBox.warning(self, "ESC Programming",
                             "The FC refused ESC programming mode.\n\n"
                             "Disarm the aircraft and try again.")
-
-    def _on_gps_ubx_relay_toggle(self):
-        if not self.connected:
-            QMessageBox.information(self, "GPS UBX Relay",
-                                    "Connect to the FC first (Connect button).")
-            return
-        self._gps_ubx_relay_desired = not self._gps_ubx_relay_on
-        self.log_debug(
-            f"📤 GPS UBX relay {'ON' if self._gps_ubx_relay_desired else 'OFF'} requested",
-            "Info")
-        self.send_request(PacketTag.MISC, MiscCommand.GPS_UBX_RELAY,
-                          1 if self._gps_ubx_relay_desired else 0)
-
-    def _update_gps_ubx_relay_button(self):
-        if self._gps_ubx_relay_on:
-            self.ubx_relay_btn.setText("UBX •")
-            self.ubx_relay_btn.setStyleSheet(
-                "font-weight: bold; color: #c0392b; background-color: #b03a2e;")
-        else:
-            self.ubx_relay_btn.setText("UBX")
-            self.ubx_relay_btn.setStyleSheet(
-                "font-weight: bold; color: #e67e22;")
 
     def _finalize_bb_dump(self):
         self._bb_dump_timer.stop()
@@ -3046,7 +2976,7 @@ class MainWindow(QMainWindow):
             60: "Unused", 61: "Unused", 62: "Calibration", 63: "AFName",
             64: "Wind", 65: "Unused", 66: "SerialPorts", 67: "ExecTime",
             68: "Unused", 69: "LinkStats", 70: "InitState", 71: "ParamRead",
-            76: "I2CErrors", 77: "ParamImage", 79: "State", 80: "GPS_UBX",
+            76: "I2CErrors", 77: "ParamImage", 79: "State",
         }
         tag_name = TAG_NAMES.get(tag, f"Unknown({tag})")
         tag_ok = "OK" if parsed is not None else "FAIL"
@@ -3252,8 +3182,8 @@ class MainWindow(QMainWindow):
                     cmd = getattr(self, '_pending_misc_command', None)
                     # The FC calibration ACKs (IMU/Accel/Mag) go out with tag
                     # 52, not with the MiscCommand sub-tag - the documented
-                    # contract for tag-52 acks. ESC_PROG and GPS_UBX_RELAY
-                    # ack with the sub-tag. Accept both.
+                    # contract for tag-52 acks. ESC_PROG acks with the sub-tag.
+                    # Accept both.
                     if cmd is not None and (at == cmd or at == PacketTag.MISC):
                         self._pending_misc_command = None
                         if cmd == MiscCommand.ESC_PROG:
@@ -3261,17 +3191,6 @@ class MainWindow(QMainWindow):
                                 self._on_esc_prog_ack()
                             else:
                                 self._on_esc_prog_denied()
-                        elif cmd == MiscCommand.GPS_UBX_RELAY:
-                            if ok:
-                                self._gps_ubx_relay_on = self._gps_ubx_relay_desired
-                                self._update_gps_ubx_relay_button()
-                                self.log_debug(
-                                    f"📡 GPS UBX relay {'enabled' if self._gps_ubx_relay_on else 'disabled'}",
-                                    "Info")
-                            else:
-                                self.log_debug(
-                                    "❌ GPS UBX relay command NACKed by the FC",
-                                    "Errors")
                         elif self.calib_window is not None:
                             self.calib_window.on_misc_ack(cmd, ok)
 
@@ -3505,27 +3424,6 @@ class MainWindow(QMainWindow):
                 # this arm means data[0] == SOH and the u16 length is in range,
                 # so the slice needs no further guard.
                 self._on_meta_packet(data[4:4 + extract_short(data, 2)])
-
-            case 80:
-                if isinstance(parsed, dict):
-                    packet_logger.log_received(80, "GPS_UBX", parsed)
-                    raw = parsed.get('raw', b'')
-                    now = time.time()
-                    if now - getattr(self, '_gps_ubx_log_t', 0.0) >= 0.5:
-                        self._gps_ubx_log_t = now
-                        if len(raw) >= 6:
-                            cls_id = (raw[2] << 8) | raw[3]
-                            ln = raw[4] | (raw[5] << 8)
-                            self.log_debug(
-                                f"📡 GPS UBX 0x{cls_id:04X} payload={ln}B "
-                                f"relayed {len(raw)}B (first 64B of sentence)",
-                                "Info")
-                        else:
-                            self.log_debug(
-                                f"📡 GPS UBX relay: {len(raw)}B (truncated)",
-                                "Info")
-                else:
-                    packet_logger.log_received(80, "GPS_UBX", parsed)
 
             case _:
                 packet_logger.log_received(tag, f"TAG{tag}", parsed)

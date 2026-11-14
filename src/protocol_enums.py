@@ -62,7 +62,6 @@ class PacketTag(IntEnum):
     I2C_ERRORS = 76
     REBOOT = 78
     STATE = 79  # flight/boot-state breadcrumb, one byte, emitted on change
-    GPS_UBX_RELAY = 80  # GPS UBX raw sentence relay
     UNUSED_ALTITUDE_CONTROL = 60
     UNUSED_SOARING = 61
     CALIBRATION = 62
@@ -117,7 +116,6 @@ class MiscCommand(IntEnum):
     SET_NAV_MODE = 11     # Set NavMode RC channel value: 0=Low(PIC), 1=Middle(Hold/Mission), 2=High(RTH)
     CYCLE_BB_LOG = 12     # Cycle black box log type
     ESC_PROG = 13         # Enter ESC programming (4way/MSP runtime feed-through)
-    GPS_UBX_RELAY = 14    # Toggle GPS UBX raw-sentence relay (RAM-only, a2 = desired state)
 
 
 # ============================================================================
