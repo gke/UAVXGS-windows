@@ -15,6 +15,7 @@ Calibration and flight-safety work 2026-09-27 by OpenCode, Big Pickle & Friends.
 """
 
 import os
+import math
 import re
 import struct
 from typing import Any, Dict, List, Optional, Tuple
@@ -25,7 +26,7 @@ from protocol_enums import (
     IMUFilterType, Config1Bits, Config2Bits, FailsafeAction,
     AIRFRAME_NAMES, ESC_TYPE_NAMES, RX_TYPE_NAMES, ARMING_MODE_NAMES,
     RF_TYPE_NAMES, AS_SENSOR_TYPE_NAMES,
-    MOTOR_STOP_NAMES, BB_LOG_NAMES, FAILSAFE_ACTION_NAMES,
+    MOTOR_STOP_NAMES, FAILSAFE_ACTION_NAMES,
 )
 from parameters import PARAM_DISPLAY_MULT
 
@@ -52,7 +53,7 @@ ENUM_MAP: Dict[str, type] = {
     'CONFIG1_BITS': Config1Bits,
     'CONFIG2_BITS': Config2Bits,
     'FAILSAFE_ACTION': FailsafeAction,
-    'BB_LOG_TYPE': None,
+    'UNUSED_14': None,
     'SERVO_SENSE': None,
     'UNUSED_37': None,
     'UNUSED_58': None,
@@ -74,7 +75,6 @@ _COMBO_ENUM_MAP: Dict[int, tuple] = {
     ParamIndex.RF_SENSOR_TYPE: (RangefinderType, RF_TYPE_NAMES),
     ParamIndex.AS_SENSOR_TYPE: (AirspeedSensorType, AS_SENSOR_TYPE_NAMES),
     ParamIndex.MOTOR_STOP_SEL: (None, MOTOR_STOP_NAMES),
-    ParamIndex.BB_LOG_TYPE: (None, BB_LOG_NAMES),
     ParamIndex.FAILSAFE_ACTION: (FailsafeAction, FAILSAFE_ACTION_NAMES),
 }
 
@@ -193,6 +193,26 @@ def _format_value(param_name: str, raw_value: float) -> str:
     return f'{raw_value:.8g}'
 
 
+def require_finite(tag: int, value: float, context: str) -> float:
+    """Refuse a non-finite parameter value at the GCS boundary.
+
+    Python's float() silently accepts 'nan'/'inf'/'-inf', so a corrupted or
+    hand-edited .af loads clean today and re-ships on every save. The GCS is
+    a source of badness as well as a display sink; this is the guard for
+    that role. Raises ValueError with the offending parameter so the caller
+    can report and refuse the load/write. Never masks or substitutes.
+    """
+    try:
+        ok = math.isfinite(value)
+    except TypeError:
+        ok = False
+    if not ok:
+        raise ValueError(
+            f"{context}: {ParamIndex(tag).name} (tag {tag}) = {value!r} "
+            f"is not finite — refusing to use it")
+    return value
+
+
 def parse_af(text: str) -> Tuple[str, Dict[int, float], Dict[str, Any]]:
     """Parse .af file text → (name, {tag: raw_float_value}, metadata_dict).
 
@@ -245,12 +265,15 @@ def parse_af(text: str) -> Tuple[str, Dict[int, float], Dict[str, Any]]:
             if len(parts) != 2:
                 continue
             try:
-                limits[tag] = (float(parts[0].strip()), float(parts[1].strip()))
+                lo = float(parts[0].strip())
+                hi = float(parts[1].strip())
             except ValueError:
                 continue
+            limits[tag] = (require_finite(tag, lo, f".af '{name}' [LIMITS]"),
+                           require_finite(tag, hi, f".af '{name}' [LIMITS]"))
             continue
         val = _parse_value(param_name, value_text)
-        values[tag] = val
+        values[tag] = require_finite(tag, val, f".af '{name}'")
     if limits:
         metadata['LIMITS'] = limits
     if unknown:

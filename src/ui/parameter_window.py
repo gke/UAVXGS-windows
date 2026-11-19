@@ -37,7 +37,6 @@ from protocol_enums import (
     IMU_FILTER_NAMES,
     GYRO_LPF_NAMES,
     ACC_LPF_NAMES,
-    BB_LOG_NAMES,
     MOTOR_STOP_NAMES,
     FAILSAFE_ACTION_NAMES,
     ALL_AIRFRAMES,
@@ -46,6 +45,7 @@ from protocol_enums import (
 from protocol_constants import FlightState, FLIGHT_STATE_NAMES
 from packet_parser import *
 from core.data_manager import data_manager
+from core.console import console
 from parameters import PARAMETER_DEFS, PARAM_DEFAULTS, PARAM_LIMITS, PARAM_TYPES, PARAM_DISPLAY_MULT, PID_GAIN_TAGS, PARAM_BOOT_REQUIRED
 from airframes import airframes as af_module
 import workspace
@@ -648,7 +648,7 @@ class ParameterWindow(QMainWindow):
         (ParamIndex.RX_GEAR_CH, "NavMode", 6),
         (ParamIndex.RX_AUX6_CH, "PassThru", 7),
         (ParamIndex.RX_AUX7_CH, "Dive", 8),
-        (ParamIndex.RX_AUX4_CH, "Trace", 9),
+        (ParamIndex.RX_AUX4_CH, "Aux2", 9),
         (ParamIndex.RX_AUX5_CH, "RateGain", 10),
         (ParamIndex.RX_AUX3_CH, "CamPitch", 11),
     ]
@@ -704,7 +704,7 @@ class ParameterWindow(QMainWindow):
         (ParamIndex.MAX_CLIMB_RATE_MP_S, "Climb Shape (m/s)", 3),
         (ParamIndex.SPIRAL_DESCENT_BAND_M, "Spiral Band (m)", 3),
         (ParamIndex.MOTOR_STOP_SEL, "Motor Stop", 0, list(MOTOR_STOP_NAMES.values())),
-        (ParamIndex.BB_LOG_TYPE, "BB Log", 0, list(BB_LOG_NAMES.values())),
+
     ]
     
     GENERAL_PARAMS = [
@@ -866,7 +866,7 @@ class ParameterWindow(QMainWindow):
         """Send debug message to parent window's log if available"""
         if self.parent_window and hasattr(self.parent_window, 'log_debug'):
             self.parent_window.log_debug(msg, "Info")
-        print(msg)
+        console(msg)
     
 
     
@@ -1504,6 +1504,8 @@ class ParameterWindow(QMainWindow):
                 "padding: 4px 12px; background-color: #bdc3c7; color: #2c3e50; "
                 "border: 1px solid #95a5a6; border-radius: 3px;")
             self.commit_btn.setText("Commit to FC")
+            self.commit_btn.setEnabled(False)
+        if getattr(self.parent_window, '_tx_muted', False):
             self.commit_btn.setEnabled(False)
 
     def _mark_dirty(self):
@@ -2266,7 +2268,7 @@ class ParameterWindow(QMainWindow):
         # fleet character-curve machinery computes gains from AF type + slider +
         # physics, but angle gains are now locked-derived
         # (QKp = RateMax/(2·sin(AngleMax/2))) and rate gains are pot-bracketed
-        # (Ch10) + trace-measured per airframe, so the slider has no seat in the
+        # (Ch10) + identify-measured per airframe, so the slider has no seat in the
         # field workflow. Set UAVXGS_DEV_TUNE_SLIDER=1 to restore the full row
         # (all widgets are still constructed so compute_defaults /
         # _get_scale_factors / reset_to_computed / metadata round-trip stay
@@ -2907,9 +2909,9 @@ class ParameterWindow(QMainWindow):
         self._cascade_warnings = caveats
         if caveats:
             caveat_str = "\n".join(caveats)
-            print(f"⚠️ Cascade integrity caveats: {len(caveats)}")
+            console(f"⚠️ Cascade integrity caveats: {len(caveats)}")
             for c in caveats:
-                print(f"   - {c}")
+                console(f"   - {c}")
             if hasattr(self, '_sim_btn') and self._sim_btn:
                 self._sim_btn.setText(f"Cascade caveats: {len(caveats)}")
             new_msg = self._last_caveat_msg != caveat_str
@@ -4410,9 +4412,10 @@ class ParameterWindow(QMainWindow):
         """Current value of a config-bitmask parameter, or None if unknown.
 
         Other windows need this to mirror FC gate conditions that depend on
-        config bits - e.g. the calibration window must know whether UseMag is
-        set before it can say an uncalibrated mag "blocks arming", because the
-        FC's CalibrationSufficient() only demands it when MagInUse() holds.
+        config bits - e.g. the calibration window must know whether a mag is
+        fitted before it can say an uncalibrated mag "blocks arming", because
+        the FC's PreflightBlocks() only demands mag calibration when MagInUse()
+        holds.
         Returns None rather than 0 when the value has not been read back yet,
         so a caller can tell "not known" from "known to be clear".
         """
@@ -4562,7 +4565,8 @@ class ParameterWindow(QMainWindow):
             if widget is not None:
                 if isinstance(widget, QDoubleSpinBox):
                     mult = self._display_mult(i)
-                    vals.append(widget.value() / mult)
+                    vals.append(af_module.require_finite(
+                        i, widget.value() / mult, "param save"))
                 elif isinstance(widget, QComboBox):
                     data = widget.itemData(widget.currentIndex())
                     if data is None:
@@ -4570,9 +4574,11 @@ class ParameterWindow(QMainWindow):
                             f"Combo param {i} selection has no data "
                             f"(index {widget.currentIndex()}) — refusing to save "
                             f"a positional index as the value")
-                    vals.append(float(data))
+                    vals.append(af_module.require_finite(i, float(data),
+                                                         "param save"))
                 elif isinstance(widget, QSpinBox):
-                    vals.append(float(widget.value()))
+                    vals.append(af_module.require_finite(i, float(widget.value()),
+                                                         "param save"))
                 else:
                     vals.append(0.0)
             else:
@@ -4886,17 +4892,18 @@ class ParameterWindow(QMainWindow):
             self._log(f"  ❌ Airframe file not found: {path}")
             return
 
-        reply = QMessageBox.question(
-            self,
-            "Airframe Defaults",
-            f"Load defaults for \"{name}\"?\n\n"
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Question)
+        box.setWindowTitle("Airframe Defaults")
+        box.setText(f"Load defaults for \"{name}\"?")
+        box.setInformativeText(
             "This replaces the current parameter values in the UI only —\n"
             "nothing is sent to the flight controller yet. Press Commit to\n"
-            "write the new set to flash and restart the FC.",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No
-        )
-        if reply == QMessageBox.No:
+            "write the new set to flash and restart the FC.")
+        box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        box.setDefaultButton(QMessageBox.No)
+        self._place_at_main(box)
+        if box.exec_() == QMessageBox.No:
             return
 
         try:
@@ -5212,8 +5219,6 @@ class ParameterWindow(QMainWindow):
 
     def save_params(self):
         from datetime import datetime
-        raw_vals = self._raw_float_values()
-        raw_dict = {i: raw_vals[i] for i in range(self.MAX_PARAMS)}
         
         # Generate physics summary for filename
         phys_meta = self._phys_to_metadata()
@@ -5247,6 +5252,8 @@ class ParameterWindow(QMainWindow):
         if not path.lower().endswith(".af"):
             path += ".af"
         try:
+            raw_vals = self._raw_float_values()
+            raw_dict = {i: raw_vals[i] for i in range(self.MAX_PARAMS)}
             metadata = {}
             if self._character_slider:
                 metadata['Character'] = str(self._character_slider.value())
@@ -5270,15 +5277,26 @@ class ParameterWindow(QMainWindow):
         flash on connect, or the file just loaded)."""
         self._user_dir = workspace.airframes_dir()
         dialog = AfLoadDialog(self, classify_fn=self._category_for_af_file)
-        win = self.window()
-        if win is not None:
-            dialog.move(win.geometry().topLeft())
+        self._place_at_main(dialog)
         if dialog.exec_() != QDialog.Accepted:
             return
         path = dialog.get_selected_path()
         if not path:
             return
         self._load_airframe(path)
+
+    def _place_at_main(self, dialog):
+        """Put a modal dialog at this window's top-left before it is shown.
+
+        Qt leaves a parented dialog wherever the window manager decides, so
+        the airframe prompts landed in an arbitrary spot on the screen
+        instead of where the operator is working. adjustSize() first so the
+        move is to the final size and the WM has nothing left to re-centre.
+        """
+        win = self.window()
+        if win is not None:
+            dialog.adjustSize()
+            dialog.move(win.geometry().topLeft())
 
     def _get_param_value(self, idx):
         """Safely get parameter value from widget"""
@@ -5544,6 +5562,11 @@ class ParameterWindow(QMainWindow):
             self._apply_retry_pending = True
             self._log("⚠️ Apply & Reboot already in progress — queued; will run when the current commit cycle resolves")
             self.status_label.setText("⏳ Commit in progress — apply queued (waiting)")
+            self.status_label.setStyleSheet("color: #f39c12;")
+            return
+        if getattr(self.parent_window, '_tx_muted', False):
+            self._log("  🔇 FC still booting (no tag 79 yet) - commit refused")
+            self.status_label.setText("🔇 FC booting — commit once it is up")
             self.status_label.setStyleSheet("color: #f39c12;")
             return
         if not (self.parent_window and getattr(self.parent_window, 'connected', False)):

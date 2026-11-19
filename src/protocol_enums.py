@@ -100,7 +100,7 @@ class MiscCommand(IntEnum):
     CAL_MAG = 1           # Calibrate Magnetometer
     LB = 2                # Loopback test
     UNUSED = 3            # Unused
-    BB_DUMP = 4           # Dump Black Box
+    BB_DUMP_UNUSED = 4    # slot retained: black-box dump removed with Trace 2026-11-19
     GPS_PASS_THRU_UNUSED = 5   # Slot retained: GPS pass-through removed
     CAL_ACC = 6           # Calibrate Accelerometer only
     # Slot 7 retained, retired 2026-09-28. Was the blocking two-temperature
@@ -114,7 +114,8 @@ class MiscCommand(IntEnum):
     # Slot 9 = GPS_INIT reserved (removed: blocked the FC main loop ~9.4s → IWDG reset)
     FORCE_DEFAULTS = 10   # Reset all params to embedded defaults
     SET_NAV_MODE = 11     # Set NavMode RC channel value: 0=Low(PIC), 1=Middle(Hold/Mission), 2=High(RTH)
-    CYCLE_BB_LOG = 12     # Cycle black box log type
+    # Slot 12 retained: black-box log cycling removed with the black-box remnants 2026-11-19. Wire value kept so ESC_PROG=13 does not shift.
+    CYCLE_BB_LOG_UNUSED = 12
     ESC_PROG = 13         # Enter ESC programming (4way/MSP runtime feed-through)
 
 
@@ -138,18 +139,6 @@ class TelemetryType(IntEnum):
 
 
 # ============================================================================
-# In-Flight Logs (from telem.h inflightLogs enum)
-# ============================================================================
-class InflightLog(IntEnum):
-    """In-flight log types - matches telem.h inflightLogs"""
-    eLogUAVX = 0
-    eLogAltitude = 1
-    eLogPitch = 2
-    eLogRoll = 3
-    eLogYaw = 4
-
-
-# ============================================================================
 # RC Controls (from params.h RCControls enum)
 # ============================================================================
 class RCControl(IntEnum):
@@ -163,7 +152,7 @@ class RCControl(IntEnum):
     eNavModeRC = 6
     ePassThruRC = 7
     eDiveRC = 8
-    eTraceRC = 9
+    eAux2ServoRC = 9
     eTransitionRC = 10
     eAux1CamPitchRC = 11
     eNullRC = 12
@@ -629,7 +618,7 @@ class Config1Bits(IntFlag):
     eTestMission = eUnused1_6      # legacy .af token — do not re-use
 
     # bit 2 — FREE (was Use Mag). A magnetometer is used when one is fitted and
-    # answers its probe (F.MagnetometerActive); presence alone decides fusion,
+    # answers its probe (F.HaveMag); presence alone decides fusion,
     # so there is no permission to withdraw. Absent an override bit a pilot who
     # does not want the compass disconnects it, which is the physical statement
     # of the same intent. eUsingMag is kept as an alias because every
@@ -752,7 +741,7 @@ class ParamIndex(IntEnum):
     YAW_RATE_KP = 10           # 11
     ROLL_RATE_KD = 11          # 12
     IMU_FILT_TYPE = 12         # 13
-    BB_LOG_TYPE = 13           # 14
+    UNUSED_14 = 13            # 14 (was BB_LOG_TYPE; black-box removed 2026-11-19)
     RX_TYPE = 14               # 15
     CONFIG1_BITS = 15          # 16
     RX_THROTTLE_CH = 16        # 17
@@ -864,7 +853,7 @@ class ParamIndex(IntEnum):
     RUDDER_MOTOR_FF = 122          # 123
     SPIRAL_DESCENT_BAND_M = 123      # 124 — residual altitude (m) that triggers MR spiral-orbit descent
     FW_PITCH_AUTHORITY = 124  # 125 — stabilised FW pitch output scale (was FS_CONFIG_BITS)
-    TRACE_TYPE = 125   # trace capture selector (TraceTypes: 0=None 1=Rate 2=Attitude 3=AltHold 4=Actuator 5=IMU)
+    UNUSED_126 = 125   # slot retained: trace capture selector removed 2026-11-19
     FW_YAW_AUTHORITY = 126  # 127 — stabilised FW yaw output scale
     POWER_RESET_CAUSE = 127
 
@@ -906,7 +895,7 @@ RC_MAPPING_NAMES = {
     ParamIndex.RX_AUX1_CH: "AttMode",
     ParamIndex.RX_AUX2_CH: "Arming",
     ParamIndex.RX_AUX3_CH: "CamPitch",
-    ParamIndex.RX_AUX4_CH: "Trace",
+    ParamIndex.RX_AUX4_CH: "Aux2",
     ParamIndex.RX_AUX5_CH: "Aux5",
     ParamIndex.RX_AUX6_CH: "Aux6",
     ParamIndex.RX_AUX7_CH: "Aux7",
@@ -1098,15 +1087,6 @@ ACC_LPF_NAMES = {
     4: "20",
     5: "10",
     6: "5",
-}
-
-BB_LOG_NAMES = {
-    0: "Off",
-    1: "Altitude",
-    2: "Pitch",
-    3: "Roll",
-    4: "Yaw",
-    5: "Attitude",
 }
 
 MOTOR_STOP_NAMES = {

@@ -27,7 +27,7 @@ PARAMETER_DEFS: Dict[int, Parameter] = {
     10: Parameter("YawRateKp", "Yaw rate P gain"),
     11: Parameter("RollRateKd", "Roll rate D gain"),
     12: Parameter("IMUFiltType", "IMU filter type"),
-    13: Parameter("BBLogType", "Blackbox log type"),
+    13: Parameter("Unused14", "Unused -- was BBLogType (black-box removed 2026-11-19)"),
     14: Parameter("RxType", "RX type"),
     15: Parameter("Config1Bits", "Configuration bitfield 1 (Emulation)"),
     16: Parameter("RxThrottleCh", "Throttle channel mapping"),
@@ -139,7 +139,7 @@ PARAMETER_DEFS: Dict[int, Parameter] = {
     122: Parameter("RudderMotorFF", "Rudder Motor Feedforward (%)"),
     123: Parameter("SpiralDescentBandM", "Spiral descent trigger band (m) — residual altitude that engages MR spiral-orbit descent"),
     124: Parameter("FWPitchAuthority", "Stabilised FW pitch output authority (%)"),
-    125: Parameter("TraceType", "Trace capture selector (U8, TraceTypes enum): 0=None 1=Rate 2=Attitude 3=AltHold 4=Actuator 5=IMU"),
+    125: Parameter("Unused126", "Reserved: trace capture selector removed 2026-11-19"),
     126: Parameter("FWYawAuthority", "Stabilised FW yaw output authority (%)"),
     127: Parameter("PowerResetCause", "Reset cause"),
 }
@@ -270,7 +270,7 @@ PARAM_DEFAULTS: Dict[int, float] = {
     122: 0,
     123: 3,
     124: 1,
-    125: 1,
+    125: 0,
     126: 1,
     127: 0,
 }
@@ -559,7 +559,7 @@ PARAM_LIMITS: Dict[int, Tuple[float, float]] = {
     10: (0.001, 1),
     11: (0, 1),
     12: (0, 5),
-    13: (0, 4),
+    13: (0, 255),
     14: (0, 5),
     15: (0, 255),
     16: (0, 15),
@@ -671,7 +671,7 @@ PARAM_LIMITS: Dict[int, Tuple[float, float]] = {
     122: (0, 20),
     123: (0, 15),
     124: (0.25, 1.25),
-    125: (0, 5),
+    125: (0, 255),
     126: (0.25, 1.25),
     127: (0, 7),
 }
@@ -820,4 +820,4 @@ PARAM_BOOT_REQUIRED: set = {
 # Reproduces the FC's ParamMetaDigest() over type+cls+boot+label+min+max+scale.
 # Tag 58 asked for index 0xFF answers with the FC's own digest: a mismatch means this
 # projection is stale, so regenerate it (default_val is outside the digest by design).
-PARAM_META_DIGEST: int = 0x59F1C9A7
+PARAM_META_DIGEST: int = 0x9E7DCC5F
