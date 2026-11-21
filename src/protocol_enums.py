@@ -378,11 +378,11 @@ class FlightState(IntEnum):
     eInFlight = 5
     eIREmulateUNUSED = 6
     ePreflight = 7
-    eReady = 8
+    ePreflightOK = 8
     eThrottleOpenCheck = 9
     eErectingGyros = 10
     eMonitorInstruments = 11
-    eInitialisingGPS = 12
+    eWaitGPSFix = 12
     eBootStepBase = 13
     eStepSerial = 14
     eStepTarget = 15
@@ -416,12 +416,12 @@ class FlightState(IntEnum):
     # at explicit values: nothing existing renumbers, and because these are
     # explicit the auto-numbered eStep* run above cannot collide with them.
     eLivePreflight = 60
-    eLiveReady = 61
+    eLivePreflightOK = 61
     eLiveStarting = 62
     eLiveErectingGyros = 63
     eLiveWarmup = 64
     eLiveMonitorInstruments = 65
-    eLiveInitialisingGPS = 66
+    eLiveWaitGPSFix = 66
     eLiveThrottleOpenCheck = 67
     eLiveLanded = 68
     eLiveLanding = 69
@@ -437,11 +437,11 @@ class FlightState(IntEnum):
             cls.eInFlight: "Flying",
             cls.eIREmulateUNUSED: "IREmulate",
             cls.ePreflight: "Preflight",
-            cls.eReady: "Preflight OK",
+            cls.ePreflightOK: "Preflight OK",
             cls.eThrottleOpenCheck: "Throttle",
             cls.eErectingGyros: "Erect Gyros",
             cls.eMonitorInstruments: "Instrumentation",
-            cls.eInitialisingGPS: "Wait GPS Fix",
+            cls.eWaitGPSFix: "Wait GPS Fix",
             cls.eStepSerial: "Init Serial",
             cls.eStepTarget: "Init Target",
             cls.eStepDrives: "Init Drives",
@@ -468,12 +468,12 @@ class FlightState(IntEnum):
             cls.eStepGPS: "Init GPS Drv",
             cls.eStepIdentify: "Init Identify",
             cls.eLivePreflight: "Live Preflight",
-            cls.eLiveReady: "Live Ready",
+            cls.eLivePreflightOK: "Live Preflight OK",
             cls.eLiveStarting: "Live Starting",
             cls.eLiveErectingGyros: "Live Erect Gyros",
             cls.eLiveWarmup: "Live Warmup",
             cls.eLiveMonitorInstruments: "Live Monitor Instr",
-            cls.eLiveInitialisingGPS: "Live Init GPS",
+            cls.eLiveWaitGPSFix: "Live Wait GPS Fix",
             cls.eLiveThrottleOpenCheck: "Live Throttle Chk",
             cls.eLiveLanded: "Live Landed",
             cls.eLiveLanding: "Live Landing",
@@ -484,7 +484,7 @@ class FlightState(IntEnum):
 
     @classmethod
     def get_mnemonic(cls, state: int) -> str:
-        """Short code per state (2-5 chars), for logs and compact columns.
+        """Short code per state (2-6 chars), for logs and compact columns.
 
         Mirrors get_name()'s shape so the two can be swapped freely. Not used by
         any display - call it explicitly. The eLive* codes carry an "L." prefix
@@ -500,11 +500,11 @@ class FlightState(IntEnum):
             cls.eInFlight: "FLY",
             cls.eIREmulateUNUSED: "---",
             cls.ePreflight: "PF",
-            cls.eReady: "RDY",
+            cls.ePreflightOK: "PFOK",
             cls.eThrottleOpenCheck: "THR",
             cls.eErectingGyros: "GYR",
             cls.eMonitorInstruments: "MON",
-            cls.eInitialisingGPS: "GPS",
+            cls.eWaitGPSFix: "WGPS",
             cls.eStepSerial: "SER",
             cls.eStepTarget: "TGT",
             cls.eStepDrives: "DRV",
@@ -531,12 +531,12 @@ class FlightState(IntEnum):
             cls.eStepGPS: "GDR",
             cls.eStepIdentify: "IDN",
             cls.eLivePreflight: "L.PF",
-            cls.eLiveReady: "L.RDY",
+            cls.eLivePreflightOK: "L.PFOK",
             cls.eLiveStarting: "L.STG",
             cls.eLiveErectingGyros: "L.GYR",
             cls.eLiveWarmup: "L.WRM",
             cls.eLiveMonitorInstruments: "L.MON",
-            cls.eLiveInitialisingGPS: "L.GPS",
+            cls.eLiveWaitGPSFix: "L.WGPS",
             cls.eLiveThrottleOpenCheck: "L.THR",
             cls.eLiveLanded: "L.LND",
             cls.eLiveLanding: "L.LNG",
