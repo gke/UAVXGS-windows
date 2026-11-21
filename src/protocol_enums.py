@@ -645,18 +645,19 @@ class Config2Bits(IntFlag):
     eUnused2_2 = 0x04              # bit 2 — FREE (was UseESCProg). ESC-Prog is now
                                    # runtime-triggered via the GCS ESC button (miscESCProg),
                                    # so it needs no config bit. Available for a future feature.
-    eUnused2_3 = 0x08              # bit 3 — FREE (was Have GPS). A receiver is
-                                   # used when one is wired and speaks UBX; the
-                                   # FC latches presence from the first valid
-                                   # packet. eUseGPS kept as a legacy .af token.
-    eUseGPS = eUnused2_3           # legacy .af token — do not re-use
+    eUseGPS = 0x08                 # bit 3 — SET = require a GPS lock before
+                                   # launch. Receiver use is still autodetected;
+                                   # this bit only withdraws permission to fly
+                                   # without a fix. Clearing it is a conscious
+                                   # act for a GPS-less airframe.
+    eUnused2_3 = eUseGPS           # legacy .af token — do not re-use
     ePropsInwards = 0x10           # bit 4 — SET = front two props rotate INWARDS (usual convention)
     eUseTurnToWP = 0x20           # bit 5
     eUseNavBeep = 0x40             # bit 6
     eUnused2_7 = 0x80              # bit 7 — FREE. Available for a future feature.
 
-    # Default Config2 = FC DEFAULT_CONFIG2 (params.c): BattComp|NavBeep
-    DEFAULT = eUseBatteryComp | eUseNavBeep
+    # Default Config2 = FC DEFAULT_CONFIG2 (params.c): BattComp|GPS|NavBeep
+    DEFAULT = eUseBatteryComp | eUseGPS | eUseNavBeep
 
 
 # ============================================================================

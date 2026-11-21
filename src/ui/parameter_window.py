@@ -4173,7 +4173,7 @@ class ParameterWindow(QMainWindow):
         self.config2_checks = []
         config2_bits = [
             ("Batt Comp", 0), ("Unused 2-1", 1, True), ("Unused 2-2", 2, True),
-            ("Unused 2-3", 3, True), ("Prop In", 4), ("Turn WP", 5), ("Beep WP", 6),
+            ("Have GPS", 3), ("Prop In", 4), ("Turn WP", 5), ("Beep WP", 6),
             ("Unused 2-7", 7, True),
         ]
         for i, item in enumerate(config2_bits):
@@ -4189,11 +4189,9 @@ class ParameterWindow(QMainWindow):
                               "and falls back on the stored bias, and a never-calibrated FC is "
                               "blocked from arming by the FC instead.")
             elif bit == 3:
-                cb.setEnabled(False)
-                cb.setToolTip("Unused — free config bit (Config2 bit 3), was Have GPS.\n"
-                              "A receiver is used when one is wired and speaks UBX; the FC "
-                              "latches presence from the first valid packet, so there is no "
-                              "permission bit. To fly without GPS, disconnect it.")
+                cb.setToolTip("Have GPS — require a GPS lock before launch.\n"
+                              "Receiver use is autodetected; this bit only gates take-off. "
+                              "Clear it deliberately on a GPS-less airframe.")
             elif unused:
                 cb.setEnabled(False)
                 cb.setToolTip(f"Unused — free config bit (Config2 bit {bit}). Available for a future feature.")
@@ -5469,11 +5467,11 @@ class ParameterWindow(QMainWindow):
                     combo.blockSignals(False)
         
         # Defaults: Config1 = RTHDescend|AltHoldAlarm, mirroring the FC's
-        # DEFAULT_CONFIG1 in params.c; Config2 = Batt Comp + Nav Beep, mirroring
-        # DEFAULT_CONFIG2. Both the Use Mag and Have GPS permission bits are
-        # retired — presence of the device decides, not a declaration.
+        # DEFAULT_CONFIG1 in params.c; Config2 = Batt Comp + Have GPS + Nav Beep,
+        # mirroring DEFAULT_CONFIG2. A GPS-less airframe clears Have GPS as a
+        # conscious act; mag presence stays autodetected.
         self._set_config_default(ParamIndex.CONFIG1_BITS, int(Config1Bits.eUseRTHDescend | Config1Bits.eUseAltHoldAlarm))
-        self._set_config_default(ParamIndex.CONFIG2_BITS, int(Config2Bits.eUseBatteryComp | Config2Bits.eUseNavBeep))
+        self._set_config_default(ParamIndex.CONFIG2_BITS, int(Config2Bits.eUseBatteryComp | Config2Bits.eUseGPS | Config2Bits.eUseNavBeep))
         
         self.update_config_display()
         self.update_rc_display()
