@@ -736,7 +736,7 @@ class ParameterWindow(QMainWindow):
     ]
     
     ESTIMATOR_PARAMS = [
-        (ParamIndex.MADGWICK_KP_MAG, "Kp Mag", 0.5),
+        (ParamIndex.MADGWICK_KP_MAG, "Kp Mag", 0.001),
         (ParamIndex.MADGWICK_KP_ACC, "Kp Acc", 0.4),
         (ParamIndex.ACC_CONF_SD, "Acc Conf (SD)", 16.67),
     ]
@@ -4152,10 +4152,10 @@ class ParameterWindow(QMainWindow):
 
         self.config1_checks = []
         config1_bits = [
-            ("Ext Mag", 0), ("Autoland", 1), ("Unused 1-2", 2, True),
+            ("Ext Mag", 0), ("Autoland", 1), ("Use Mag", 2),
             ("Emulation", 3, True, "Emulation disabled — commissioning is real flight only."),
             ("AH Alarm", 4), ("GPS Alt", 5),
-            ("Unused 1-6", 6, True), ("Clamp", 7),
+            ("Unused 1-6", 6, True), ("Yaw Clamp", 7),
         ]
         for i, item in enumerate(config1_bits):
             name, bit = item[0], item[1]
@@ -4164,6 +4164,9 @@ class ParameterWindow(QMainWindow):
             cb = QCheckBox(name)
             cb.setProperty("bit", bit)
             cb.stateChanged.connect(lambda s, b=bit: self.bit_changed(ParamIndex.CONFIG1_BITS, b, s))
+            if bit == 2:
+                cb.setToolTip("Use Mag — when clear, magnetometer is completely ignored "
+                              "(no fusion, no calibration/preflight mag requirement).")
             if unused:
                 cb.setEnabled(False)
                 cb.setToolTip(tip if tip else "Unused — free config bit (Config1 bit 6). Emulation now implies the 4-WP test mission.")
@@ -5466,11 +5469,11 @@ class ParameterWindow(QMainWindow):
                     combo.setCurrentIndex(max(0, min(max_idx, clamped)))
                     combo.blockSignals(False)
         
-        # Defaults: Config1 = RTHDescend|AltHoldAlarm, mirroring the FC's
+        # Defaults: Config1 = RTHDescend|AltHoldAlarm|UseMag, mirroring the FC's
         # DEFAULT_CONFIG1 in params.c; Config2 = Batt Comp + Have GPS + Nav Beep,
         # mirroring DEFAULT_CONFIG2. A GPS-less airframe clears Have GPS as a
-        # conscious act; mag presence stays autodetected.
-        self._set_config_default(ParamIndex.CONFIG1_BITS, int(Config1Bits.eUseRTHDescend | Config1Bits.eUseAltHoldAlarm))
+        # conscious act.
+        self._set_config_default(ParamIndex.CONFIG1_BITS, int(Config1Bits.eUseRTHDescend | Config1Bits.eUseAltHoldAlarm | Config1Bits.eUseMag))
         self._set_config_default(ParamIndex.CONFIG2_BITS, int(Config2Bits.eUseBatteryComp | Config2Bits.eUseGPS | Config2Bits.eUseNavBeep))
         
         self.update_config_display()

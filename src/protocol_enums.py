@@ -62,6 +62,8 @@ class PacketTag(IntEnum):
     I2C_ERRORS = 76
     REBOOT = 78
     STATE = 79  # flight/boot-state breadcrumb, one byte, emitted on change
+    GPS_DETAIL = 81  # paged GNSS constellation/satellite/UBX detail
+    DIAG_AXIS = 82   # high-rate in-flight single/dual axis diagnostic
     UNUSED_ALTITUDE_CONTROL = 60
     UNUSED_SOARING = 61
     CALIBRATION = 62
@@ -117,6 +119,7 @@ class MiscCommand(IntEnum):
     # Slot 12 retained: black-box log cycling removed with the black-box remnants 2026-11-19. Wire value kept so ESC_PROG=13 does not shift.
     CYCLE_BB_LOG_UNUSED = 12
     ESC_PROG = 13         # Enter ESC programming (4way/MSP runtime feed-through)
+    SET_DIAG_AXIS = 14    # Select in-flight diagnostic axis stream
 
 
 # ============================================================================
@@ -279,7 +282,8 @@ class PfTerms(IntEnum):
     ePfTBaro = 8
     ePfTMag = 9
     ePfTBatt = 10
-    ePfTCount = 11
+    ePfTGPSUnsupported = 11
+    ePfTCount = 12
 
 
 # ============================================================================
@@ -609,7 +613,8 @@ class Config1Bits(IntFlag):
     eEmulationEnable = 0x08         # bit 3
     eUseAltHoldAlarm = 0x10       # bit 4
     eUseOffsetHome = 0x20          # bit 5
-    eEnforceDriveSymmetry = 0x80   # bit 7
+    eYawClamp = 0x80              # bit 7 — MR only: clamp yaw differential to throttle headroom
+    eEnforceDriveSymmetry = eYawClamp  # legacy .af token — do not re-use
 
     # bit 6 — FREE (was Test WP mission, folded into emulation 2026-09-23:
     #   F.Emulation implies the 4-WP test mission). eTestMission kept as an
@@ -617,17 +622,15 @@ class Config1Bits(IntFlag):
     eUnused1_6 = 0x40
     eTestMission = eUnused1_6      # legacy .af token — do not re-use
 
-    # bit 2 — FREE (was Use Mag). A magnetometer is used when one is fitted and
-    # answers its probe (F.HaveMag); presence alone decides fusion,
-    # so there is no permission to withdraw. Absent an override bit a pilot who
-    # does not want the compass disconnects it, which is the physical statement
-    # of the same intent. eUsingMag is kept as an alias because every
-    # generic/*.af carries CONFIG1_BITS=eUseRTHDescend|eUsingMag.
-    eUnused1_2 = 0x04
-    eUsingMag = eUnused1_2         # legacy .af token — do not re-use
+    # bit 2 — Use Mag. When clear, magnetometer is completely out of the
+    # picture (no fusion, no calibration requirement, no preflight block).
+    # When set and a mag is fitted, presence+calibration decide fusion.
+    eUseMag = 0x04
+    eUnused1_2 = eUseMag            # legacy name
+    eUsingMag = eUseMag            # legacy .af token — do not re-use
 
-    # Default Config1 = FC DEFAULT_CONFIG1 (params.c): RTHDescend|AltHoldAlarm.
-    DEFAULT = eUseRTHDescend | eUseAltHoldAlarm
+    # Default Config1 = FC DEFAULT_CONFIG1 (params.c): RTHDescend|AltHoldAlarm|UseMag.
+    DEFAULT = eUseRTHDescend | eUseAltHoldAlarm | eUseMag
 
 
 class Config2Bits(IntFlag):
